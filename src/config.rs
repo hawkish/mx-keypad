@@ -55,6 +55,9 @@ pub struct Defaults {
     /// Share of the tile's side the icon spans.
     #[serde(default = "glyph_scale")]
     pub glyph_scale: f32,
+    /// How long a key with a `long_press` action must be held for it.
+    #[serde(default = "long_press_ms")]
+    pub long_press_ms: u64,
 }
 
 impl Default for Defaults {
@@ -63,6 +66,7 @@ impl Default for Defaults {
             background: black(),
             foreground: white(),
             glyph_scale: glyph_scale(),
+            long_press_ms: long_press_ms(),
         }
     }
 }
@@ -75,6 +79,10 @@ fn white() -> Rgb {
 }
 fn glyph_scale() -> f32 {
     0.55
+}
+/// OpenLogi's long-press threshold.
+fn long_press_ms() -> u64 {
+    500
 }
 
 /// One screenful of keys.
@@ -110,6 +118,10 @@ pub struct Key {
     /// What a press does.
     #[serde(default)]
     pub action: Action,
+    /// What holding the key past `defaults.long_press_ms` does instead. A
+    /// key with one acts on release when tapped.
+    #[serde(default)]
+    pub long_press: Option<Action>,
 }
 
 /// What pressing a key does.
@@ -218,6 +230,8 @@ pub struct Setup {
     pub left: Action,
     /// The right page button's action.
     pub right: Action,
+    /// How long a press must last to count as a long press.
+    pub long_press: std::time::Duration,
 }
 
 /// A page with all nine keys filled in.
@@ -227,6 +241,8 @@ pub struct ResolvedPage {
     pub name: String,
     /// Keys 1–9 at indexes 0–8.
     pub keys: [(Face, Action); 9],
+    /// Their long-press actions, where they have one.
+    pub long: [Option<Action>; 9],
 }
 
 impl Setup {
@@ -244,10 +260,10 @@ impl Setup {
     pub fn sends_keys(&self) -> bool {
         self.left.sends_keys()
             || self.right.sends_keys()
-            || self
-                .pages
-                .iter()
-                .any(|page| page.keys.iter().any(|(_, action)| action.sends_keys()))
+            || self.pages.iter().any(|page| {
+                page.keys.iter().any(|(_, action)| action.sends_keys())
+                    || page.long.iter().flatten().any(Action::sends_keys)
+            })
     }
 
     /// Read and validate the config at `path`.
@@ -294,6 +310,7 @@ impl Setup {
                     Action::None,
                 )
             });
+            let mut long: [Option<Action>; 9] = Default::default();
             for (index, key) in &page.keys {
                 let at = format!("pages[{p}].keys.{index:?}");
                 let slot = index
@@ -302,6 +319,18 @@ impl Setup {
                     .filter(|n| (1..=9).contains(n))
                     .with_context(|| format!("{at}: keys are \"1\" to \"9\""))?;
                 check_action(&key.action, &names, &format!("{at}.action"))?;
+                if let Some(long) = &key.long_press {
+                    check_action(long, &names, &format!("{at}.long_press"))?;
+                    // Held actions need the release edge, which a key with
+                    // two actions spends on telling them apart.
+                    for (what, action) in [("action", &key.action), ("long_press", long)] {
+                        if action.is_held() {
+                            bail!(
+                                "{at}.{what}: hold and switch cannot share a key with long_press"
+                            );
+                        }
+                    }
+                }
                 let icon = key
                     .icon
                     .as_deref()
@@ -322,8 +351,10 @@ impl Setup {
                     },
                     key.action.clone(),
                 );
+                long[slot - 1].clone_from(&key.long_press);
             }
             pages.push(ResolvedPage {
+                long,
                 name: page.name.clone(),
                 keys,
             });
@@ -333,6 +364,7 @@ impl Setup {
             pages,
             left: config.page_buttons.left,
             right: config.page_buttons.right,
+            long_press: std::time::Duration::from_millis(defaults.long_press_ms),
         })
     }
 
@@ -519,6 +551,29 @@ mod tests {
         assert!(err(r#"{ "mouse": "thumb" }"#).contains(".mouse"));
         assert!(err(r#"{ "hold": "cmd+" }"#).contains(".hold"));
         assert!(err(r#"{ "sequence": [{ "keys": "cmd+zz" }] }"#).contains("sequence[0]"));
+    }
+
+    #[test]
+    fn long_press_actions_resolve_and_reject_held_actions() {
+        let setup = setup(
+            r#"{ "defaults": { "long_press_ms": 800 }, "pages": [{ "name": "a", "keys": {
+                "1": { "action": { "media": "play-pause" }, "long_press": { "media": "next" } }
+            } }] }"#,
+        )
+        .unwrap();
+        assert_eq!(setup.long_press, std::time::Duration::from_millis(800));
+        assert_eq!(setup.pages[0].long[0], Some(Action::Media("next".into())));
+        assert_eq!(setup.pages[0].long[1], None);
+        assert!(error(
+            r#"{ "pages": [{ "name": "a", "keys": {
+                "1": { "action": { "hold": "cmd+m" }, "long_press": { "text": "x" } } } }] }"#
+        )
+        .contains("cannot share a key with long_press"));
+        assert!(error(
+            r#"{ "pages": [{ "name": "a", "keys": {
+                "1": { "long_press": { "page": "nowhere" } } } }] }"#
+        )
+        .contains("long_press"));
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod hidpp;
 pub mod image;
 pub mod input;
 pub mod keys;
+pub mod press;
 pub mod render;
 mod vendor;
 

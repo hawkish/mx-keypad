@@ -14,6 +14,7 @@ use hidapi::HidApi;
 use mx_keypad::config::{self, Action, Setup};
 use mx_keypad::geometry::DISPLAY;
 use mx_keypad::keys::{self, Chord};
+use mx_keypad::press::{Fire, LongPress};
 use mx_keypad::render::{self, Face, Rgb};
 use mx_keypad::{Button, Event, KeyImageJpeg, Keypad};
 
@@ -207,7 +208,7 @@ fn events() -> Result<()> {
     keypad.divert_page_buttons(true)?;
     println!("press keys; Ctrl-C to stop");
     while !stop.load(Ordering::Relaxed) {
-        for event in poll(&mut keypad, &stop)? {
+        for event in poll(&mut keypad, &stop, TICK)? {
             println!("{event:?}");
         }
     }
@@ -225,6 +226,8 @@ struct Runner {
     tiles: HashMap<String, KeyImageJpeg>,
     /// What each pressed button is holding until it is released.
     held: HashMap<Button, Held>,
+    /// Keys with a long-press action, down and not yet decided.
+    long: LongPress<Button, Action>,
 }
 
 impl Runner {
@@ -269,6 +272,7 @@ impl Runner {
                     .position(|p| &p.name == name)
                     .unwrap_or(0);
                 self.setup = setup;
+                self.long.set_threshold(self.setup.long_press);
                 // Image files may have changed along with the config.
                 self.tiles.clear();
                 self.follow_page_buttons(keypad)?;
@@ -283,6 +287,44 @@ impl Runner {
                 Ok(())
             }
         }
+    }
+
+    /// The long-press action `button` has on the current page, if any.
+    fn long_action(&self, button: Button) -> Option<Action> {
+        match button {
+            Button::Key(n) => self.setup.pages[self.page].long[usize::from(n) - 1].clone(),
+            Button::PageLeft | Button::PageRight => None,
+        }
+    }
+
+    /// A key went down: act now, or start timing it when it has a long-press
+    /// action.
+    fn down(&mut self, keypad: &mut Keypad, button: Button) -> Result<()> {
+        let action = self.action(button);
+        match self.long_action(button) {
+            Some(long) => {
+                self.long.down(button, Instant::now(), action, long);
+                Ok(())
+            }
+            None => self.press(keypad, button, &action),
+        }
+    }
+
+    /// A key came up: decide a timed press, and let go of anything held.
+    fn up(&mut self, keypad: &mut Keypad, button: Button) -> Result<()> {
+        if let Some(Fire::Short(action) | Fire::Long(action)) = self.long.up(button, Instant::now())
+        {
+            self.press(keypad, button, &action)?;
+        }
+        self.release(button)
+    }
+
+    /// Fire the long-press actions of keys held past the threshold.
+    fn tick(&mut self, keypad: &mut Keypad) -> Result<()> {
+        for (button, action) in self.long.tick(Instant::now()) {
+            self.press(keypad, button, &action)?;
+        }
+        Ok(())
     }
 
     /// The action `button` has on the current page.
@@ -352,6 +394,7 @@ impl Runner {
 
     /// Let go of everything held, when the session ends.
     fn release_all(&mut self) {
+        self.long.clear();
         for (_, held) in self.held.drain() {
             if let Err(error) = held.release() {
                 eprintln!("{error:#}");
@@ -475,6 +518,7 @@ fn run(path: &Path) -> Result<()> {
              Privacy & Security → Accessibility; they fail until then"
         );
     }
+    let setup_long_press = setup.long_press;
     let mut runner = Runner {
         path: path.to_path_buf(),
         loaded: mtime(path),
@@ -483,6 +527,7 @@ fn run(path: &Path) -> Result<()> {
         children: Vec::new(),
         tiles: HashMap::new(),
         held: HashMap::new(),
+        long: LongPress::new(setup_long_press),
     };
     let mut api = HidApi::new()?;
     let mut waiting = false;
@@ -545,17 +590,21 @@ fn session(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Resul
 /// Act on presses and config changes until `stop` is set.
 fn serve(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
-        for event in poll(keypad, stop)? {
+        // Wake in time for a long press to fire while the key is held.
+        let timeout = runner.long.next_deadline().map_or(TICK, |at| {
+            at.saturating_duration_since(Instant::now()).min(TICK)
+        });
+        for event in poll(keypad, stop, timeout)? {
             let result = match event {
-                Event::Down(button) => {
-                    let action = runner.action(button);
-                    runner.press(keypad, button, &action)
-                }
-                Event::Up(button) => runner.release(button),
+                Event::Down(button) => runner.down(keypad, button),
+                Event::Up(button) => runner.up(keypad, button),
             };
             if let Err(error) = result {
                 eprintln!("{error:#}");
             }
+        }
+        if let Err(error) = runner.tick(keypad) {
+            eprintln!("{error:#}");
         }
         runner
             .children
@@ -567,8 +616,8 @@ fn serve(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<
 
 /// Presses within one tick. A read the signal interrupted is the signal, not
 /// a failure: the loop ends and `Drop` hands the page buttons back.
-fn poll(keypad: &mut Keypad, stop: &AtomicBool) -> Result<Vec<Event>> {
-    match keypad.poll(TICK) {
+fn poll(keypad: &mut Keypad, stop: &AtomicBool, timeout: Duration) -> Result<Vec<Event>> {
+    match keypad.poll(timeout) {
         Err(_) if stop.load(Ordering::Relaxed) => Ok(Vec::new()),
         result => result,
     }
