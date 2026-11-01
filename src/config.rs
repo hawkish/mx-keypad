@@ -191,6 +191,15 @@ pub struct ResolvedPage {
 }
 
 impl Setup {
+    /// Whether the page buttons should be taken over: when there is more than
+    /// one page to turn, or either button does something besides turning
+    /// pages. Otherwise they keep their firmware behaviour, as in OpenLogi.
+    #[must_use]
+    pub fn needs_page_buttons(&self) -> bool {
+        let pages_only = |action: &Action| matches!(action, Action::Page(_) | Action::None);
+        self.pages.len() > 1 || !pages_only(&self.left) || !pages_only(&self.right)
+    }
+
     /// Whether any key or page button sends keystrokes.
     #[must_use]
     pub fn sends_keys(&self) -> bool {
@@ -408,6 +417,19 @@ mod tests {
         assert_eq!(keys[1].0.background, Rgb(0x11, 0x22, 0x33));
         assert_eq!(keys[1].1, Action::Run("true".into()));
         assert_eq!(setup.left, Action::Page("prev".into()));
+    }
+
+    #[test]
+    fn page_buttons_are_taken_over_only_when_used() {
+        let one = setup(r#"{ "pages": [{ "name": "a" }] }"#).unwrap();
+        assert!(!one.needs_page_buttons());
+        let two = setup(r#"{ "pages": [{ "name": "a" }, { "name": "b" }] }"#).unwrap();
+        assert!(two.needs_page_buttons());
+        let bound = setup(
+            r#"{ "pages": [{ "name": "a" }], "page_buttons": { "left": { "run": "true" } } }"#,
+        )
+        .unwrap();
+        assert!(bound.needs_page_buttons());
     }
 
     #[test]

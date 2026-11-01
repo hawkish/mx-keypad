@@ -1,5 +1,6 @@
 //! `mx-keypad`: run a JSON keypad setup, or poke the keypad by hand.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +15,7 @@ use mx_keypad::config::{self, Action, Setup};
 use mx_keypad::geometry::DISPLAY;
 use mx_keypad::keys::{self, Chord};
 use mx_keypad::render::{self, Face, Rgb};
-use mx_keypad::{Button, Event, Keypad};
+use mx_keypad::{Button, Event, KeyImageJpeg, Keypad};
 
 #[cfg(target_os = "macos")]
 mod service;
@@ -200,15 +201,33 @@ struct Runner {
     loaded: Option<SystemTime>,
     page: usize,
     children: Vec<Child>,
+    /// Rendered tiles by face, so a page is rendered once per config load.
+    tiles: HashMap<String, KeyImageJpeg>,
 }
 
 impl Runner {
-    fn show(&self, keypad: &mut Keypad) -> Result<()> {
+    /// Draw the current page. Tiles come from the cache, and `Keypad::draw`
+    /// skips keys that already show theirs.
+    fn show(&mut self, keypad: &mut Keypad) -> Result<()> {
         for (i, (face, _)) in self.setup.pages[self.page].keys.iter().enumerate() {
-            let tile = render::render_tile(face, DISPLAY.key_size)?;
+            // `Face` holds an f32, so it is keyed by its full Debug form.
+            let key = format!("{face:?}");
+            let tile = match self.tiles.get(&key) {
+                Some(tile) => tile.clone(),
+                None => {
+                    let tile = render::render_tile(face, DISPLAY.key_size)?;
+                    self.tiles.insert(key, tile.clone());
+                    tile
+                }
+            };
             keypad.draw(u8::try_from(i + 1)?, &tile)?;
         }
         Ok(())
+    }
+
+    /// Take the page buttons over only when the setup uses them.
+    fn follow_page_buttons(&self, keypad: &mut Keypad) -> Result<()> {
+        keypad.divert_page_buttons(self.setup.needs_page_buttons())
     }
 
     /// Reload when the file changed; keep the old setup if the new one is
@@ -228,6 +247,9 @@ impl Runner {
                     .position(|p| &p.name == name)
                     .unwrap_or(0);
                 self.setup = setup;
+                // Image files may have changed along with the config.
+                self.tiles.clear();
+                self.follow_page_buttons(keypad)?;
                 if let Some(level) = self.setup.brightness {
                     keypad.set_brightness(level)?;
                 }
@@ -275,6 +297,8 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 
 fn run(path: &Path) -> Result<()> {
     let stop = interrupted()?;
+    #[cfg(target_os = "macos")]
+    service::trim_log();
     let setup = Setup::load(path)?;
     if setup.sends_keys() && !keys::trusted(true) {
         eprintln!(
@@ -288,6 +312,7 @@ fn run(path: &Path) -> Result<()> {
         setup,
         page: 0,
         children: Vec::new(),
+        tiles: HashMap::new(),
     };
     let mut api = HidApi::new()?;
     let mut waiting = false;
@@ -338,7 +363,7 @@ fn run(path: &Path) -> Result<()> {
 
 /// Set up a freshly opened keypad and serve it until `stop` or an error.
 fn session(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<()> {
-    keypad.divert_page_buttons(true)?;
+    runner.follow_page_buttons(keypad)?;
     if let Some(level) = runner.setup.brightness {
         keypad.set_brightness(level)?;
     }

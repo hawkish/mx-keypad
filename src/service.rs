@@ -25,6 +25,26 @@ pub fn log_path() -> Result<PathBuf> {
     Ok(home()?.join("Library/Logs/mx-keypad.log"))
 }
 
+/// Largest the log may grow before `run` trims it.
+const LOG_LIMIT: u64 = 1 << 20;
+
+/// Empty the agent's log when it has outgrown [`LOG_LIMIT`]. launchd appends
+/// to the same open file, so trimming it in place keeps logging working.
+pub fn trim_log() {
+    let Ok(path) = log_path() else { return };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return;
+    };
+    if meta.len() <= LOG_LIMIT {
+        return;
+    }
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
+        if file.set_len(0).is_ok() {
+            eprintln!("log trimmed: it had grown past {} KiB", LOG_LIMIT / 1024);
+        }
+    }
+}
+
 fn domain() -> String {
     // SAFETY: getuid has no failure mode.
     format!("gui/{}", unsafe { libc_getuid() })
