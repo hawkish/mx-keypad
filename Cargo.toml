@@ -1,0 +1,38 @@
+[package]
+name = "mx-keypad"
+version = "0.1.0"
+edition = "2021"
+description = "Drive the Logitech MX Creative Keypad's LCD keys, configured from JSON"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "mx_keypad"
+
+[[bin]]
+name = "mx-keypad"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+resvg = "0.45"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+thiserror = "2"
+
+# Same backends as tmux-legion, so it can take this crate as a library without
+# a second hidapi configuration. The native Linux backend reports usage_page,
+# which selecting the keypad's vendor node needs.
+[target.'cfg(target_os = "linux")'.dependencies]
+hidapi = { version = "2", default-features = false, features = [
+  "linux-native-basic-udev",
+] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+hidapi = "2"
+
+[profile.release]
+strip = true
+lto = true

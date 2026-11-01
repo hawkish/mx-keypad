@@ -1,0 +1,27 @@
+{
+  "brightness": 70,
+  "defaults": { "background": "#000000", "foreground": "#ffffff", "glyph_scale": 0.55 },
+  "pages": [
+    {
+      "name": "main",
+      "keys": {
+        "1": { "icon": "square-terminal", "label": "Shell", "action": { "run": "open -a Terminal" } },
+        "2": { "icon": "globe", "label": "Web", "action": { "run": "open https://example.com" } },
+        "3": { "icon": "folder", "label": "Home", "action": { "run": "open ~" } },
+        "4": { "icon": "bell", "background": "#cc3333", "action": { "run": "osascript -e 'display notification \"Pressed\" with title \"mx-keypad\"'" } },
+        "5": { "icon": "play", "background": "#1e6f50", "action": { "run": "osascript -e 'tell application \"Music\" to playpause'" } },
+        "6": { "icon": "lock", "action": { "run": "pmset displaysleepnow" } },
+        "9": { "icon": "chevron-right", "label": "More", "action": { "page": "next" } }
+      }
+    },
+    {
+      "name": "more",
+      "keys": {
+        "1": { "icon": "settings", "label": "Settings", "action": { "run": "open -a 'System Settings'" } },
+        "5": { "icon": "star", "foreground": "#f5c542", "glyph_scale": 0.7 },
+        "7": { "icon": "chevron-left", "label": "Back", "action": { "page": "main" } }
+      }
+    }
+  ],
+  "page_buttons": { "left": { "page": "prev" }, "right": { "page": "next" } }
+}

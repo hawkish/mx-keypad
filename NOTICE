@@ -1,0 +1,14 @@
+mx-keypad
+Copyright (c) 2026 Morten Høgh
+
+The keypad protocol code is ported from OpenLogi
+(https://github.com/aprilnea/openlogi), Copyright (c) 2026 AprilNEA,
+dual-licensed MIT OR Apache-2.0. The ported parts are src/vendor.rs,
+src/geometry.rs, src/image.rs, src/input.rs, src/render.rs and the
+protocol facts in PROTOCOL.md.
+
+OpenLogi's image-write layout follows node-logitech-mx-creative-console
+(MIT).
+
+The icons in icons/ are from Lucide (https://lucide.dev), ISC License,
+Copyright (c) Lucide Contributors, by way of OpenLogi.
