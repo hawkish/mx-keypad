@@ -1,10 +1,18 @@
-//! Keystrokes a key can send: a shortcut such as `cmd+shift+4`, or a string
-//! typed as text.
+//! Keystrokes a key can send: a shortcut such as `cmd+shift+4`, a string
+//! typed as text, or a media key.
 //!
 //! mx-keypad posts the events itself, so macOS asks Accessibility permission
 //! of mx-keypad rather than of whatever terminal or tmux server launched it.
-//! Key codes are macOS virtual key codes for the ANSI layout; text is sent as
-//! Unicode and does not depend on the layout.
+//!
+//! A shortcut names its key either by position (`return`, `left`, `f5`, …),
+//! which is the same on every layout, or by the character it types (`q`,
+//! `[`, `å`). A character is looked up in the current keyboard layout when
+//! the shortcut is sent, together with the modifiers that layout needs for
+//! it: on a Danish layout `cmd+[` is sent as cmd+option+8, the keys that type
+//! `[` there. Characters no key types fall back to their US-ANSI position.
+//! Text is sent as Unicode and does not depend on the layout.
+
+use std::collections::HashMap;
 
 use anyhow::{bail, Result};
 
@@ -13,12 +21,22 @@ use anyhow::{bail, Result};
 pub struct Chord {
     /// Held modifiers.
     pub modifiers: Modifiers,
-    /// The macOS virtual key code pressed.
-    pub key: u16,
+    /// The key pressed.
+    pub key: Key,
+}
+
+/// The key of a shortcut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    /// A key by its macOS virtual key code: one whose position is the same on
+    /// every layout.
+    Code(u16),
+    /// The key that types this character on the current layout.
+    Char(char),
 }
 
 /// Modifier keys, as flags.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Modifiers {
     /// Command.
     pub cmd: bool,
@@ -30,15 +48,55 @@ pub struct Modifiers {
     pub shift: bool,
 }
 
+impl Modifiers {
+    const SHIFT: Modifiers = Modifiers {
+        cmd: false,
+        ctrl: false,
+        alt: false,
+        shift: true,
+    };
+    const ALT: Modifiers = Modifiers {
+        cmd: false,
+        ctrl: false,
+        alt: true,
+        shift: false,
+    };
+    const SHIFT_ALT: Modifiers = Modifiers {
+        cmd: false,
+        ctrl: false,
+        alt: true,
+        shift: true,
+    };
+
+    /// Both sets of modifiers held.
+    #[must_use]
+    pub const fn with(self, other: Modifiers) -> Modifiers {
+        Modifiers {
+            cmd: self.cmd || other.cmd,
+            ctrl: self.ctrl || other.ctrl,
+            alt: self.alt || other.alt,
+            shift: self.shift || other.shift,
+        }
+    }
+}
+
+/// A shortcut resolved to what is actually pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resolved {
+    /// The macOS virtual key code.
+    pub code: u16,
+    /// Every modifier held: the shortcut's own and those the layout needs.
+    pub modifiers: Modifiers,
+}
+
 impl Chord {
     /// Parse `"cmd+ctrl+q"`: modifiers and one key, joined by `+`, any case.
-    /// `plus` names the `=`/`+` key, since `+` is the separator; add `shift`
-    /// to get `+`.
+    /// `plus` names the `+` character, since `+` is the separator.
     pub fn parse(text: &str) -> Result<Chord> {
         let mut modifiers = Modifiers::default();
         let mut key = None;
         for part in text.split('+').map(str::trim) {
-            let part = part.to_ascii_lowercase();
+            let part = part.to_lowercase();
             match part.as_str() {
                 "cmd" | "command" | "super" => modifiers.cmd = true,
                 "ctrl" | "control" => modifiers.ctrl = true,
@@ -50,7 +108,7 @@ impl Chord {
                         bail!("{text:?}: more than one non-modifier key");
                     }
                     key = Some(
-                        key_code(name)
+                        parse_key(name)
                             .ok_or_else(|| anyhow::anyhow!("{text:?}: unknown key {name:?}"))?,
                     );
                 }
@@ -61,57 +119,137 @@ impl Chord {
         };
         Ok(Chord { modifiers, key })
     }
+
+    /// What to press for this shortcut on the current keyboard layout. On
+    /// macOS this asks the Text Input Sources API, which must be called on
+    /// the main thread.
+    #[must_use]
+    pub fn resolve(&self) -> Resolved {
+        let (code, needed) = match self.key {
+            Key::Code(code) => (code, Modifiers::default()),
+            Key::Char(c) => platform::layout_key(c)
+                .or_else(|| ansi_code(c).map(|code| (code, Modifiers::default())))
+                // `parse_key` only accepts characters with an ANSI fallback
+                // or a single non-ASCII character; the latter with no key on
+                // this layout is sent as key code 0, which types nothing
+                // harmful and is reported by the app as unknown.
+                .unwrap_or((0, Modifiers::default())),
+        };
+        Resolved {
+            code,
+            modifiers: self.modifiers.with(needed),
+        }
+    }
 }
 
-/// The macOS virtual key code (ANSI layout) of a key name.
-fn key_code(name: &str) -> Option<u16> {
+/// A key name: a position, a punctuation alias, or one character.
+fn parse_key(name: &str) -> Option<Key> {
+    const FKEYS: [u16; 12] = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111];
+    if let Some(n) = name.strip_prefix('f').and_then(|n| n.parse::<usize>().ok()) {
+        return FKEYS.get(n.checked_sub(1)?).copied().map(Key::Code);
+    }
+    let position = match name {
+        "return" | "enter" => Some(36),
+        "tab" => Some(48),
+        "space" => Some(49),
+        "delete" | "backspace" => Some(51),
+        "escape" | "esc" => Some(53),
+        "forwarddelete" => Some(117),
+        "home" => Some(115),
+        "end" => Some(119),
+        "pageup" => Some(116),
+        "pagedown" => Some(121),
+        "left" => Some(123),
+        "right" => Some(124),
+        "down" => Some(125),
+        "up" => Some(126),
+        _ => None,
+    };
+    if let Some(code) = position {
+        return Some(Key::Code(code));
+    }
+    let alias = match name {
+        "plus" => Some('+'),
+        "equal" => Some('='),
+        "minus" => Some('-'),
+        "quote" => Some('\''),
+        "semicolon" => Some(';'),
+        "backslash" => Some('\\'),
+        "comma" => Some(','),
+        "slash" => Some('/'),
+        "period" => Some('.'),
+        "grave" => Some('`'),
+        _ => None,
+    };
+    if let Some(c) = alias {
+        return Some(Key::Char(c));
+    }
+    let mut chars = name.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if !c.is_control() && !c.is_whitespace() => Some(Key::Char(c)),
+        _ => None,
+    }
+}
+
+/// The US-ANSI key code that types `c` without modifiers.
+fn ansi_code(c: char) -> Option<u16> {
     const LETTERS: [u16; 26] = [
         0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46, 45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16,
         6,
     ];
     const DIGITS: [u16; 10] = [29, 18, 19, 20, 21, 23, 22, 26, 28, 25];
-    const FKEYS: [u16; 12] = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111];
-    let mut chars = name.chars();
-    if let (Some(c), None) = (chars.next(), chars.next()) {
-        if c.is_ascii_lowercase() {
-            return Some(LETTERS[usize::from(c as u8 - b'a')]);
-        }
-        if c.is_ascii_digit() {
-            return Some(DIGITS[usize::from(c as u8 - b'0')]);
-        }
+    if c.is_ascii_lowercase() {
+        return Some(LETTERS[usize::from(c as u8 - b'a')]);
     }
-    if let Some(n) = name.strip_prefix('f').and_then(|n| n.parse::<usize>().ok()) {
-        return FKEYS.get(n.checked_sub(1)?).copied();
+    if c.is_ascii_digit() {
+        return Some(DIGITS[usize::from(c as u8 - b'0')]);
     }
-    Some(match name {
-        "=" | "equal" => 24,
-        "-" | "minus" => 27,
-        "]" => 30,
-        "[" => 33,
-        "'" | "quote" => 39,
-        ";" | "semicolon" => 41,
-        "\\" | "backslash" => 42,
-        "," | "comma" => 43,
-        "/" | "slash" => 44,
-        "." | "period" => 47,
-        "`" | "grave" => 50,
-        "plus" => 24,
-        "return" | "enter" => 36,
-        "tab" => 48,
-        "space" => 49,
-        "delete" | "backspace" => 51,
-        "escape" | "esc" => 53,
-        "forwarddelete" => 117,
-        "home" => 115,
-        "end" => 119,
-        "pageup" => 116,
-        "pagedown" => 121,
-        "left" => 123,
-        "right" => 124,
-        "down" => 125,
-        "up" => 126,
+    Some(match c {
+        '=' | '+' => 24,
+        '-' => 27,
+        ']' => 30,
+        '[' => 33,
+        '\'' => 39,
+        ';' => 41,
+        '\\' => 42,
+        ',' => 43,
+        '/' => 44,
+        '.' => 47,
+        '`' => 50,
         _ => return None,
     })
+}
+
+/// Every character a layout types, with the key code and modifiers that
+/// type it.
+pub(crate) type LayoutTable = HashMap<char, (u16, Modifiers)>;
+
+/// The numeric keypad's key codes: searched only after the main block, so a
+/// digit or `+` resolves to the keys a shortcut means.
+const KEYPAD: std::ops::RangeInclusive<u16> = 65..=92;
+
+/// Every character a layout types, with the key code and modifiers that
+/// type it. `translate(code, modifiers)` is the layout. The main block wins
+/// over the numeric keypad; within each, the plainest way to type a
+/// character wins: no modifiers, then shift, option, shift+option.
+pub(crate) fn layout_table(translate: impl Fn(u16, Modifiers) -> Option<char>) -> LayoutTable {
+    let mut table = HashMap::new();
+    let main = (0..128).filter(|code| !KEYPAD.contains(code));
+    for codes in [main.collect::<Vec<_>>(), KEYPAD.collect()] {
+        for modifiers in [
+            Modifiers::default(),
+            Modifiers::SHIFT,
+            Modifiers::ALT,
+            Modifiers::SHIFT_ALT,
+        ] {
+            for &code in &codes {
+                if let Some(c) = translate(code, modifiers) {
+                    table.entry(c).or_insert((code, modifiers));
+                }
+            }
+        }
+    }
+    table
 }
 
 /// Whether this process may post keystrokes. With `prompt`, macOS shows its
@@ -123,7 +261,23 @@ pub fn trusted(prompt: bool) -> bool {
 
 /// Press and release `chord`.
 pub fn send_chord(chord: Chord) -> Result<()> {
-    platform::send_chord(chord)
+    let resolved = chord.resolve();
+    platform::post_modifiers(resolved.modifiers, true)?;
+    let tapped = platform::post_key(resolved.code, resolved.modifiers, true)
+        .and_then(|()| platform::post_key(resolved.code, resolved.modifiers, false));
+    platform::post_modifiers(resolved.modifiers, false)?;
+    tapped
+}
+
+/// Press (`down`) or release a resolved shortcut's modifiers.
+pub fn press_modifiers(modifiers: Modifiers, down: bool) -> Result<()> {
+    platform::post_modifiers(modifiers, down)
+}
+
+/// Press (`down`) or release a resolved shortcut's key, with `modifiers`
+/// marked as held.
+pub fn press_key(resolved: Resolved, down: bool) -> Result<()> {
+    platform::post_key(resolved.code, resolved.modifiers, down)
 }
 
 /// Type `text`.
@@ -195,8 +349,11 @@ mod platform {
     use core_foundation::string::{CFString, CFStringRef};
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use std::collections::HashMap;
+    use std::ffi::c_void;
+    use std::sync::Mutex;
 
-    use super::Chord;
+    use super::{LayoutTable, Modifiers};
 
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
@@ -227,10 +384,8 @@ mod platform {
         Ok(())
     }
 
-    pub(super) fn send_chord(chord: Chord) -> Result<()> {
-        require_trust()?;
+    fn flags(m: Modifiers) -> CGEventFlags {
         let mut flags = CGEventFlags::empty();
-        let m = chord.modifiers;
         if m.cmd {
             flags |= CGEventFlags::CGEventFlagCommand;
         }
@@ -243,13 +398,176 @@ mod platform {
         if m.shift {
             flags |= CGEventFlags::CGEventFlagShift;
         }
-        for down in [true, false] {
-            let event = CGEvent::new_keyboard_event(source()?, chord.key, down)
+        flags
+    }
+
+    pub(super) fn post_key(code: u16, modifiers: Modifiers, down: bool) -> Result<()> {
+        require_trust()?;
+        let event = CGEvent::new_keyboard_event(source()?, code, down)
+            .map_err(|()| anyhow!("cannot create a key event"))?;
+        event.set_flags(flags(modifiers));
+        event.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+
+    /// Press or release the modifier keys themselves, so apps that watch
+    /// modifier state (push-to-talk, the app switcher) see them held.
+    pub(super) fn post_modifiers(modifiers: Modifiers, down: bool) -> Result<()> {
+        // Left command, shift, option, control.
+        let keys = [
+            (
+                modifiers.cmd,
+                55,
+                Modifiers {
+                    cmd: true,
+                    ..Modifiers::default()
+                },
+            ),
+            (
+                modifiers.shift,
+                56,
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
+            ),
+            (
+                modifiers.alt,
+                58,
+                Modifiers {
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            ),
+            (
+                modifiers.ctrl,
+                59,
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+            ),
+        ];
+        let mut held = if down {
+            Modifiers::default()
+        } else {
+            modifiers
+        };
+        for (wanted, code, flag) in keys {
+            if !wanted {
+                continue;
+            }
+            if down {
+                held = held.with(flag);
+            } else {
+                held = Modifiers {
+                    cmd: held.cmd && !flag.cmd,
+                    ctrl: held.ctrl && !flag.ctrl,
+                    alt: held.alt && !flag.alt,
+                    shift: held.shift && !flag.shift,
+                };
+            }
+            require_trust()?;
+            let event = CGEvent::new_keyboard_event(source()?, code, down)
                 .map_err(|()| anyhow!("cannot create a key event"))?;
-            event.set_flags(flags);
+            event.set_type(core_graphics::event::CGEventType::FlagsChanged);
+            event.set_flags(flags(held));
             event.post(CGEventTapLocation::HID);
         }
         Ok(())
+    }
+
+    #[link(name = "Carbon", kind = "framework")]
+    extern "C" {
+        fn TISCopyCurrentKeyboardLayoutInputSource() -> *const c_void;
+        fn TISGetInputSourceProperty(source: *const c_void, key: CFStringRef) -> *const c_void;
+        static kTISPropertyUnicodeKeyLayoutData: CFStringRef;
+        static kTISPropertyInputSourceID: CFStringRef;
+        fn LMGetKbdType() -> u8;
+        fn UCKeyTranslate(
+            layout: *const c_void,
+            code: u16,
+            action: u16,
+            modifier_state: u32,
+            keyboard_type: u32,
+            options: u32,
+            dead_key_state: *mut u32,
+            max_length: usize,
+            actual_length: *mut usize,
+            chars: *mut u16,
+        ) -> i32;
+    }
+
+    extern "C" {
+        fn CFRelease(cf: *const c_void);
+        fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
+    }
+
+    /// The layout table of the layout it was built for, by input source ID.
+    static LAYOUT: Mutex<Option<(String, LayoutTable)>> = Mutex::new(None);
+
+    /// The key and modifiers that type `c` on the current layout.
+    pub(super) fn layout_key(c: char) -> Option<(u16, Modifiers)> {
+        // SAFETY: TIS returns a +1 reference we release below; the layout
+        // data is owned by the source and read only while it is alive.
+        unsafe {
+            let source = TISCopyCurrentKeyboardLayoutInputSource();
+            if source.is_null() {
+                return None;
+            }
+            let id = TISGetInputSourceProperty(source, kTISPropertyInputSourceID);
+            let id = if id.is_null() {
+                String::new()
+            } else {
+                CFString::wrap_under_get_rule(id.cast()).to_string()
+            };
+            let mut cache = LAYOUT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache.as_ref().map(|(cached, _)| cached) != Some(&id) {
+                let data = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData);
+                let table = if data.is_null() {
+                    HashMap::new()
+                } else {
+                    let layout = CFDataGetBytePtr(data).cast::<c_void>();
+                    let kind = u32::from(LMGetKbdType());
+                    super::layout_table(|code, modifiers| translate(layout, kind, code, modifiers))
+                };
+                *cache = Some((id, table));
+            }
+            CFRelease(source);
+            cache.as_ref().and_then(|(_, table)| table.get(&c).copied())
+        }
+    }
+
+    /// The character `code` types with `modifiers` held, ignoring dead keys.
+    unsafe fn translate(layout: *const c_void, kind: u32, code: u16, m: Modifiers) -> Option<char> {
+        // Carbon modifier bits, shifted down a byte: shift 0x02, option 0x08.
+        let state = (u32::from(m.shift) << 1) | (u32::from(m.alt) << 3);
+        let mut dead = 0u32;
+        let mut buf = [0u16; 4];
+        let mut len = 0usize;
+        // kUCKeyActionDisplay, kUCKeyTranslateNoDeadKeysMask.
+        let status = UCKeyTranslate(
+            layout,
+            code,
+            3,
+            state,
+            kind,
+            1,
+            &mut dead,
+            buf.len(),
+            &mut len,
+            buf.as_mut_ptr(),
+        );
+        if status != 0 || len == 0 {
+            return None;
+        }
+        let mut chars = char::decode_utf16(buf[..len].iter().copied());
+        match (chars.next(), chars.next()) {
+            (Some(Ok(c)), None) if !c.is_control() => Some(c),
+            _ => None,
+        }
     }
 
     /// `NSPoint`, for `otherEventWithType:…`'s location argument.
@@ -269,7 +587,7 @@ mod platform {
     extern "C" {}
 
     extern "C" {
-        fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
+        fn CGEventPost(tap: u32, event: *mut c_void);
     }
 
     pub(super) fn send_media(key: super::MediaKey) -> Result<()> {
@@ -303,7 +621,7 @@ mod platform {
                     bail!("cannot create a media key event");
                 }
                 // SAFETY: `event` is a live NSEvent within this pool.
-                let cg: *mut std::ffi::c_void = unsafe { msg_send![event, CGEvent] };
+                let cg: *mut c_void = unsafe { msg_send![event, CGEvent] };
                 if cg.is_null() {
                     bail!("cannot convert the media key event");
                 }
@@ -339,13 +657,21 @@ mod platform {
 mod platform {
     use anyhow::{bail, Result};
 
-    use super::Chord;
+    use super::Modifiers;
 
     pub(super) fn trusted(_prompt: bool) -> bool {
         false
     }
 
-    pub(super) fn send_chord(_chord: Chord) -> Result<()> {
+    pub(super) fn layout_key(_c: char) -> Option<(u16, Modifiers)> {
+        None
+    }
+
+    pub(super) fn post_key(_code: u16, _modifiers: Modifiers, _down: bool) -> Result<()> {
+        bail!("sending keystrokes is only supported on macOS")
+    }
+
+    pub(super) fn post_modifiers(_modifiers: Modifiers, _down: bool) -> Result<()> {
         bail!("sending keystrokes is only supported on macOS")
     }
 
@@ -365,27 +691,85 @@ mod tests {
     #[test]
     fn chords_parse_modifiers_in_any_order_and_case() {
         let lock = Chord::parse("Ctrl+CMD+q").unwrap();
-        assert_eq!(lock.key, 12);
+        assert_eq!(lock.key, Key::Char('q'));
         assert!(lock.modifiers.cmd && lock.modifiers.ctrl);
         assert!(!lock.modifiers.alt && !lock.modifiers.shift);
-        assert_eq!(Chord::parse("cmd+[").unwrap().key, 33);
-        assert_eq!(Chord::parse("shift + 4").unwrap().key, 21);
-        assert_eq!(Chord::parse("f12").unwrap().key, 111);
-        assert_eq!(
-            Chord::parse("return").unwrap().modifiers,
-            Modifiers::default()
-        );
+        assert_eq!(Chord::parse("cmd+[").unwrap().key, Key::Char('['));
+        assert_eq!(Chord::parse("cmd+å").unwrap().key, Key::Char('å'));
+        assert_eq!(Chord::parse("cmd+plus").unwrap().key, Key::Char('+'));
+        assert_eq!(Chord::parse("f12").unwrap().key, Key::Code(111));
+        assert_eq!(Chord::parse("return").unwrap().key, Key::Code(36));
     }
 
     #[test]
-    fn every_letter_and_digit_has_a_distinct_code() {
+    fn every_letter_and_digit_has_a_distinct_ansi_code() {
         let mut codes: Vec<u16> = ('a'..='z')
             .chain('0'..='9')
-            .map(|c| key_code(&c.to_string()).unwrap())
+            .map(|c| ansi_code(c).unwrap())
             .collect();
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(codes.len(), 36);
+    }
+
+    /// A slice of the Danish layout: `[` is option+8, `+` sits where US has
+    /// `-`, and `å` where US has `[`.
+    fn danish(code: u16, m: Modifiers) -> Option<char> {
+        let plain = m == Modifiers::default();
+        match code {
+            12 if plain => Some('q'),
+            28 if plain => Some('8'),
+            28 if m == Modifiers::SHIFT => Some('('),
+            28 if m == Modifiers::ALT => Some('['),
+            27 if plain => Some('+'),
+            33 if plain => Some('å'),
+            // The numeric keypad's 8 must lose to the top row's.
+            91 if plain => Some('8'),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_layout_table_finds_the_plainest_way_to_type_each_character() {
+        let table = layout_table(danish);
+        assert_eq!(table[&'['], (28, Modifiers::ALT));
+        assert_eq!(table[&'q'], (12, Modifiers::default()));
+        assert_eq!(table[&'+'], (27, Modifiers::default()));
+        assert_eq!(table[&'å'], (33, Modifiers::default()));
+        assert_eq!(table[&'8'], (28, Modifiers::default()));
+        assert!(!table.contains_key(&'@'));
+    }
+
+    /// A slice of the US layout: `+` is shift+`=` on the main block, and
+    /// unshifted on the numeric keypad.
+    fn us(code: u16, m: Modifiers) -> Option<char> {
+        match (code, m) {
+            (24, m) if m == Modifiers::default() => Some('='),
+            (24, m) if m == Modifiers::SHIFT => Some('+'),
+            (69, m) if m == Modifiers::default() => Some('+'),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_main_block_wins_over_the_numeric_keypad() {
+        assert_eq!(layout_table(us)[&'+'], (24, Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn layout_modifiers_add_to_the_shortcuts_own() {
+        let cmd = Modifiers {
+            cmd: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            cmd.with(Modifiers::ALT),
+            Modifiers {
+                cmd: true,
+                alt: true,
+                ..Modifiers::default()
+            }
+        );
     }
 
     #[test]
@@ -402,6 +786,7 @@ mod tests {
         assert!(err("cmd+shift").contains("no key"));
         assert!(err("cmd+a+b").contains("more than one"));
         assert!(err("cmd+banana").contains("unknown key"));
+        assert!(err("cmd+tab tab").contains("unknown key"));
         assert!(err("cmd++").contains("empty part"));
         assert!(err("f13").contains("unknown key"));
     }

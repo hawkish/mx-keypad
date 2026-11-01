@@ -94,6 +94,11 @@ enum Cmd {
     Uninstall,
     /// List the built-in icon names.
     Icons,
+    /// Show what a shortcut presses on the current keyboard layout.
+    Resolve {
+        /// A shortcut, such as `cmd+[`.
+        chord: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -133,6 +138,21 @@ fn main() -> Result<()> {
         }
         #[cfg(target_os = "macos")]
         Cmd::Uninstall => service::uninstall(),
+        Cmd::Resolve { chord } => {
+            let resolved = Chord::parse(&chord)?.resolve();
+            let m = resolved.modifiers;
+            let names: Vec<&str> = [
+                (m.cmd, "cmd"),
+                (m.ctrl, "ctrl"),
+                (m.alt, "alt"),
+                (m.shift, "shift"),
+            ]
+            .into_iter()
+            .filter_map(|(held, name)| held.then_some(name))
+            .collect();
+            println!("key code {} with [{}]", resolved.code, names.join(", "));
+            Ok(())
+        }
         Cmd::Icons => {
             for name in render::builtin_icon_names() {
                 println!("{name}");
