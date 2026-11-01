@@ -87,6 +87,28 @@ fn launchctl(args: &[&str]) -> Result<bool> {
     Ok(status.success())
 }
 
+/// Unload the agent and wait until launchd has let it go. `bootout` returns
+/// while the agent is still exiting (it blanks the keys first), and loading
+/// the label again before then fails with an I/O error.
+fn stop_agent() -> Result<()> {
+    let target = format!("{}/{LABEL}", domain());
+    let _ = launchctl(&["bootout", &target]);
+    for _ in 0..100 {
+        let loaded = Command::new("launchctl")
+            .args(["print", &target])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .context("cannot run launchctl")?
+            .success();
+        if !loaded {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    bail!("{LABEL} did not stop within 10 s")
+}
+
 /// Where `install` keeps its signed copy of the executable. A fixed path
 /// and a stable signature keep the Accessibility permission across rebuilds.
 fn installed_exe() -> Result<PathBuf> {
@@ -186,7 +208,7 @@ pub fn install(config: &Path, identity: Option<&str>) -> Result<()> {
     }
     // Stop a running install first, so it has cleared the keys before the
     // new one draws: bootout fails harmlessly when none is loaded.
-    let _ = launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
+    stop_agent()?;
     let exe = install_exe(identity)?;
     std::fs::write(&path, plist(&exe, &config, &log))
         .with_context(|| format!("cannot write {}", path.display()))?;
@@ -205,7 +227,7 @@ pub fn install(config: &Path, identity: Option<&str>) -> Result<()> {
 /// Stop the agent and remove it.
 pub fn uninstall() -> Result<()> {
     let path = plist_path()?;
-    let _ = launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
+    stop_agent()?;
     let _ = std::fs::remove_file(installed_exe()?);
     match std::fs::remove_file(&path) {
         Ok(()) => println!("uninstalled {LABEL}"),
