@@ -281,6 +281,22 @@ nix develop -c cargo test
 nix develop -c cargo clippy --all-targets -- -D warnings
 ```
 
+The Makefile wraps the everyday tasks. Run `make help` for the full list:
+
+| Command | What it does |
+|---|---|
+| `make install` | Builds with Nix, checks your config, then installs and starts the LaunchAgent. Use it after every change to the code. |
+| `make restart` | Restarts the running LaunchAgent, for example after granting Accessibility. |
+| `make stop` | Stops the LaunchAgent until the next login or `make install`. |
+| `make uninstall` | Stops the LaunchAgent and removes it. |
+| `make status` | Shows whether the LaunchAgent is running. |
+| `make log` | Follows the LaunchAgent's log. |
+| `make check` | Validates your config and renders every tile. |
+| `make test` | Runs the tests and Clippy. |
+
+Set `CONFIG=path/to/config.json` to use a config other than `~/.config/mx-keypad/config.json`.
+Config changes don't need a restart: the running agent reloads the file when it changes.
+
 ### Make a release
 
 Releases are built on a Mac outside the Nix shell, so the binary only loads system libraries. You
