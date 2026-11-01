@@ -15,6 +15,7 @@ pub mod input;
 pub mod keys;
 pub mod press;
 pub mod render;
+pub mod shift;
 mod vendor;
 
 pub use device::Keypad;

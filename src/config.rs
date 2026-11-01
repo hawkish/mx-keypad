@@ -125,6 +125,37 @@ pub struct Key {
     /// Make the key blink between its face and these colours.
     #[serde(default)]
     pub blink: Option<Blink>,
+    /// What the key shows and does while the keypad's shift is on; fields
+    /// left out follow the key's own, shifted automatically.
+    #[serde(default)]
+    pub shifted: Option<Shifted>,
+}
+
+/// A key's overrides while shift is on.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Shifted {
+    /// Built-in icon name or image path.
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// Text under the icon.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Background colour.
+    #[serde(default)]
+    pub background: Option<Rgb>,
+    /// Icon and label colour.
+    #[serde(default)]
+    pub foreground: Option<Rgb>,
+    /// Icon size.
+    #[serde(default)]
+    pub glyph_scale: Option<f32>,
+    /// What a press does.
+    #[serde(default)]
+    pub action: Option<Action>,
+    /// What a long press does.
+    #[serde(default)]
+    pub long_press: Option<Action>,
 }
 
 /// A blinking key's alternate colours and pace.
@@ -185,6 +216,33 @@ pub enum Action {
     Sequence(Vec<Action>),
     /// Wait this many milliseconds, up to 10 000; only inside a `sequence`.
     Delay(u64),
+    /// Turn the keypad's shift on: `hold`, `toggle` or `once`.
+    Shift(String),
+}
+
+/// What `action` does while the keypad's shift is on, when the key does not
+/// say: text is typed in upper case, shortcuts get shift added, and a
+/// sequence's text and shortcut steps are shifted. Anything else is the same.
+#[must_use]
+pub fn shifted_action(action: &Action) -> Action {
+    let add_shift = |chord: &str| {
+        if chord
+            .split('+')
+            .any(|part| part.trim().eq_ignore_ascii_case("shift"))
+        {
+            chord.to_string()
+        } else {
+            format!("shift+{chord}")
+        }
+    };
+    match action {
+        Action::Text(text) => Action::Text(text.to_uppercase()),
+        Action::Keys(chord) => Action::Keys(add_shift(chord)),
+        Action::Hold(chord) => Action::Hold(add_shift(chord)),
+        Action::Switch(chord) => Action::Switch(add_shift(chord)),
+        Action::Sequence(steps) => Action::Sequence(steps.iter().map(shifted_action).collect()),
+        other => other.clone(),
+    }
 }
 
 /// The `system` actions.
@@ -269,8 +327,35 @@ pub struct ResolvedPage {
     pub keys: [(Face, Action); 9],
     /// Their long-press actions, where they have one.
     pub long: [Option<Action>; 9],
-    /// Blinking keys' alternate face and interval.
-    pub blink: [Option<(Face, std::time::Duration)>; 9],
+    /// Blinking keys' colours and interval.
+    pub blink: [Option<BlinkSpec>; 9],
+    /// Keys 1–9 while shift is on.
+    pub shifted_keys: [(Face, Action); 9],
+    /// Their long-press actions while shift is on.
+    pub shifted_long: [Option<Action>; 9],
+}
+
+/// A blinking key's alternate colours and pace, resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlinkSpec {
+    /// Background of the alternate face.
+    pub background: Rgb,
+    /// Foreground of the alternate face; the current face's when `None`.
+    pub foreground: Option<Rgb>,
+    /// How long each face shows.
+    pub interval: std::time::Duration,
+}
+
+impl BlinkSpec {
+    /// The alternate of `face`: the same icon and label in the blink colours.
+    #[must_use]
+    pub fn alternate(&self, face: &Face) -> Face {
+        Face {
+            background: self.background,
+            foreground: self.foreground.unwrap_or(face.foreground),
+            ..face.clone()
+        }
+    }
 }
 
 impl Setup {
@@ -339,7 +424,9 @@ impl Setup {
                 )
             });
             let mut long: [Option<Action>; 9] = Default::default();
-            let mut blink: [Option<(Face, std::time::Duration)>; 9] = Default::default();
+            let mut blink: [Option<BlinkSpec>; 9] = Default::default();
+            let mut shifted_keys = keys.clone();
+            let mut shifted_long: [Option<Action>; 9] = Default::default();
             for (index, key) in &page.keys {
                 let at = format!("pages[{p}].keys.{index:?}");
                 let slot = index
@@ -348,7 +435,13 @@ impl Setup {
                     .filter(|n| (1..=9).contains(n))
                     .with_context(|| format!("{at}: keys are \"1\" to \"9\""))?;
                 check_action(&key.action, &names, &format!("{at}.action"))?;
+                if matches!(key.action, Action::Shift(_)) && key.long_press.is_some() {
+                    bail!("{at}: a shift key cannot have long_press");
+                }
                 if let Some(long) = &key.long_press {
+                    if matches!(long, Action::Shift(_)) {
+                        bail!("{at}.long_press: shift only works as a key's action");
+                    }
                     check_action(long, &names, &format!("{at}.long_press"))?;
                     // Held actions need the release edge, which a key with
                     // two actions spends on telling them apart.
@@ -390,19 +483,37 @@ impl Setup {
                             BLINK_RANGE_MS.end()
                         );
                     }
-                    let face = &keys[slot - 1].0;
-                    let alternate = Face {
+                    blink[slot - 1] = Some(BlinkSpec {
                         background: b.background,
-                        foreground: b.foreground.unwrap_or(face.foreground),
-                        ..face.clone()
-                    };
-                    blink[slot - 1] =
-                        Some((alternate, std::time::Duration::from_millis(b.interval_ms)));
+                        foreground: b.foreground,
+                        interval: std::time::Duration::from_millis(b.interval_ms),
+                    });
                 }
+                let (face, action) = shifted_binding(
+                    &keys[slot - 1],
+                    key.shifted.as_ref(),
+                    base,
+                    &names,
+                    &format!("{at}.shifted"),
+                )?;
+                shifted_keys[slot - 1] = (face, action);
+                shifted_long[slot - 1] =
+                    match key.shifted.as_ref().and_then(|s| s.long_press.clone()) {
+                        Some(long) => {
+                            if key.long_press.is_none() {
+                                bail!("{at}.shifted.long_press: the key has no long_press");
+                            }
+                            check_action(&long, &names, &format!("{at}.shifted.long_press"))?;
+                            Some(long)
+                        }
+                        None => key.long_press.as_ref().map(shifted_action),
+                    };
             }
             pages.push(ResolvedPage {
                 long,
                 blink,
+                shifted_keys,
+                shifted_long,
                 name: page.name.clone(),
                 keys,
             });
@@ -432,6 +543,51 @@ impl Setup {
     }
 }
 
+/// A key's face and action while shift is on: its overrides, else its own
+/// shifted automatically. Text keys show their label in upper case; a shift
+/// key shows its colours swapped, so a latched shift is visible.
+fn shifted_binding(
+    (face, action): &(Face, Action),
+    shifted: Option<&Shifted>,
+    base: &Path,
+    names: &[&str],
+    at: &str,
+) -> Result<(Face, Action)> {
+    let over = shifted.cloned().unwrap_or_default();
+    let shifted_action = match &over.action {
+        Some(action) => {
+            check_action(action, names, &format!("{at}.action"))?;
+            action.clone()
+        }
+        None => shifted_action(action),
+    };
+    let mut face = face.clone();
+    if matches!(action, Action::Shift(_)) {
+        std::mem::swap(&mut face.background, &mut face.foreground);
+    }
+    if let Some(icon) = &over.icon {
+        face.icon = Some(icon_source(icon, base).with_context(|| format!("{at}.icon"))?);
+    }
+    match (&over.label, action) {
+        (Some(label), _) => face.label = Some(label.clone()),
+        (None, Action::Text(_)) => face.label = face.label.map(|l| l.to_uppercase()),
+        _ => {}
+    }
+    if let Some(background) = over.background {
+        face.background = background;
+    }
+    if let Some(foreground) = over.foreground {
+        face.foreground = foreground;
+    }
+    if let Some(glyph_scale) = over.glyph_scale {
+        if !(0.05..=1.0).contains(&glyph_scale) {
+            bail!("{at}.glyph_scale: {glyph_scale} is outside 0.05–1");
+        }
+        face.glyph_scale = glyph_scale;
+    }
+    Ok((face, shifted_action))
+}
+
 fn check_action(action: &Action, names: &[&str], at: &str) -> Result<()> {
     check_step(action, names, at, false)
 }
@@ -445,11 +601,18 @@ fn check_step(action: &Action, names: &[&str], at: &str, in_sequence: bool) -> R
             .with_context(|| format!("{at}.{what}"))
     };
     match action {
-        Action::Page(_) | Action::Hold(_) | Action::Switch(_) | Action::Sequence(_)
+        Action::Page(_)
+        | Action::Hold(_)
+        | Action::Switch(_)
+        | Action::Sequence(_)
+        | Action::Shift(_)
             if in_sequence =>
         {
-            bail!("{at}: a sequence step cannot be page, hold, switch or another sequence")
+            bail!("{at}: a sequence step cannot be page, hold, switch, shift or another sequence")
         }
+        Action::Shift(mode) => crate::shift::Mode::parse(mode)
+            .map(drop)
+            .with_context(|| format!("{at}.shift")),
         Action::Delay(_) if !in_sequence => bail!("{at}: delay only works inside a sequence"),
         Action::Delay(ms) if *ms > MAX_DELAY_MS => {
             bail!("{at}.delay: {ms} ms is longer than {MAX_DELAY_MS} ms")
@@ -635,19 +798,108 @@ mod tests {
             } }] }"##,
         )
         .unwrap();
-        let (face, interval) = setup.pages[0].blink[0].clone().unwrap();
-        assert_eq!(interval, std::time::Duration::from_millis(500));
+        let spec = setup.pages[0].blink[0].clone().unwrap();
+        let face = spec.alternate(&setup.pages[0].keys[0].0);
+        assert_eq!(spec.interval, std::time::Duration::from_millis(500));
         assert_eq!(face.background, Rgb(0, 0, 0));
         assert_eq!(face.foreground, Rgb(0xff, 0xff, 0));
         assert_eq!(face.icon, setup.pages[0].keys[0].0.icon);
-        let (face, interval) = setup.pages[0].blink[1].clone().unwrap();
-        assert_eq!(interval, std::time::Duration::from_millis(250));
+        let spec = setup.pages[0].blink[1].clone().unwrap();
+        let face = spec.alternate(&setup.pages[0].keys[1].0);
+        assert_eq!(spec.interval, std::time::Duration::from_millis(250));
         assert_eq!(face.foreground, Rgb(0, 0, 0));
         assert!(setup.pages[0].blink[2].is_none());
         assert!(error(
             r#"{ "pages": [{ "name": "a", "keys": { "1": { "blink": { "interval_ms": 50 } } } }] }"#
         )
         .contains("blink.interval_ms"));
+    }
+
+    #[test]
+    fn shifted_actions_follow_the_automatic_rules() {
+        assert_eq!(
+            shifted_action(&Action::Text("æ".into())),
+            Action::Text("Æ".into())
+        );
+        assert_eq!(
+            shifted_action(&Action::Text("ß".into())),
+            Action::Text("SS".into())
+        );
+        assert_eq!(
+            shifted_action(&Action::Keys("cmd+s".into())),
+            Action::Keys("shift+cmd+s".into())
+        );
+        assert_eq!(
+            shifted_action(&Action::Keys("Shift+cmd+s".into())),
+            Action::Keys("Shift+cmd+s".into())
+        );
+        assert_eq!(
+            shifted_action(&Action::Sequence(vec![
+                Action::Text("ø".into()),
+                Action::Delay(10),
+                Action::Keys("tab".into()),
+            ])),
+            Action::Sequence(vec![
+                Action::Text("Ø".into()),
+                Action::Delay(10),
+                Action::Keys("shift+tab".into()),
+            ])
+        );
+        assert_eq!(
+            shifted_action(&Action::Media("mute".into())),
+            Action::Media("mute".into())
+        );
+    }
+
+    #[test]
+    fn shifted_bindings_resolve_with_overrides_and_upper_case_text_labels() {
+        let setup = setup(
+            r##"{ "pages": [{ "name": "a", "keys": {
+                "1": { "label": "æ", "action": { "text": "æ" } },
+                "2": { "label": "Save", "action": { "keys": "cmd+s" },
+                       "shifted": { "label": "Save as", "action": { "keys": "cmd+shift+s" } } },
+                "3": { "label": "Shift", "background": "#000000", "foreground": "#ffffff",
+                       "action": { "shift": "toggle" } },
+                "4": { "label": "Go", "action": { "run": "true" } }
+            } }] }"##,
+        )
+        .unwrap();
+        let page = &setup.pages[0];
+        assert_eq!(page.shifted_keys[0].0.label.as_deref(), Some("Æ"));
+        assert_eq!(page.shifted_keys[0].1, Action::Text("Æ".into()));
+        assert_eq!(page.shifted_keys[1].0.label.as_deref(), Some("Save as"));
+        assert_eq!(page.shifted_keys[1].1, Action::Keys("cmd+shift+s".into()));
+        assert_eq!(page.shifted_keys[2].0.background, Rgb(0xff, 0xff, 0xff));
+        assert_eq!(page.shifted_keys[2].0.foreground, Rgb(0, 0, 0));
+        assert_eq!(page.shifted_keys[2].1, Action::Shift("toggle".into()));
+        assert_eq!(page.shifted_keys[3].0.label.as_deref(), Some("Go"));
+        assert_eq!(page.shifted_keys[3].1, Action::Run("true".into()));
+        // Keys without a binding stay blank and inert when shifted.
+        assert_eq!(page.shifted_keys[8].1, Action::None);
+    }
+
+    #[test]
+    fn shift_is_only_a_keys_own_action() {
+        assert!(error(
+            r#"{ "pages": [{ "name": "a", "keys": {
+            "1": { "action": { "shift": "caps" } } } }] }"#
+        )
+        .contains(".shift"));
+        assert!(error(
+            r#"{ "pages": [{ "name": "a", "keys": {
+            "1": { "action": { "shift": "hold" }, "long_press": { "text": "x" } } } }] }"#
+        )
+        .contains("cannot have long_press"));
+        assert!(error(
+            r#"{ "pages": [{ "name": "a", "keys": {
+            "1": { "action": { "text": "x" }, "long_press": { "shift": "hold" } } } }] }"#
+        )
+        .contains("only works as a key's action"));
+        assert!(error(
+            r#"{ "pages": [{ "name": "a", "keys": {
+            "1": { "action": { "sequence": [{ "shift": "once" }] } } } }] }"#
+        )
+        .contains("cannot be page, hold, switch, shift"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use mx_keypad::geometry::DISPLAY;
 use mx_keypad::keys::{self, Chord};
 use mx_keypad::press::{Fire, LongPress};
 use mx_keypad::render::{self, Face, Rgb};
+use mx_keypad::shift::{self, Shift};
 use mx_keypad::{Button, Event, KeyImageJpeg, Keypad};
 
 /// `eprintln!` with the local time in front, for the agent's log.
@@ -199,12 +200,23 @@ fn check(path: &Path, out: Option<&Path>) -> Result<()> {
                     tile.as_bytes(),
                 )?;
             }
-            if let Some((alternate, _)) = &page.blink[i] {
-                let tile = render::render_tile(alternate, DISPLAY.key_size)
+            if let Some(spec) = &page.blink[i] {
+                let tile = render::render_tile(&spec.alternate(face), DISPLAY.key_size)
                     .with_context(|| format!("page {:?} key {} blink", page.name, i + 1))?;
                 if let Some(out) = out {
                     std::fs::write(
                         out.join(format!("{}-{}-blink.jpg", page.name, i + 1)),
+                        tile.as_bytes(),
+                    )?;
+                }
+            }
+            let shifted = &page.shifted_keys[i].0;
+            if shifted != face {
+                let tile = render::render_tile(shifted, DISPLAY.key_size)
+                    .with_context(|| format!("page {:?} key {} shifted", page.name, i + 1))?;
+                if let Some(out) = out {
+                    std::fs::write(
+                        out.join(format!("{}-{}-shifted.jpg", page.name, i + 1)),
                         tile.as_bytes(),
                     )?;
                 }
@@ -248,6 +260,8 @@ struct Runner {
     long: LongPress<Button, Action>,
     /// The shared start every blinking key counts its phase from.
     blink_epoch: Instant,
+    /// The keypad's own shift.
+    shift: Shift<Button>,
 }
 
 impl Runner {
@@ -258,7 +272,7 @@ impl Runner {
         let now = Instant::now();
         let mut first_error = None;
         for i in 0..self.setup.pages[self.page].keys.len() {
-            let face = self.face(i, now).clone();
+            let face = self.face(i, now);
             // `Face` holds an f32, so it is keyed by its full Debug form.
             let key = format!("{face:?}");
             let tile = match self.tiles.get(&key) {
@@ -278,13 +292,18 @@ impl Runner {
 
     /// The face key `i` (0-based) of the current page shows at `now`: its
     /// blink face during a blinking key's alternate phase.
-    fn face(&self, i: usize, now: Instant) -> &Face {
+    fn face(&self, i: usize, now: Instant) -> Face {
         let page = &self.setup.pages[self.page];
+        let face = if self.shift.active() {
+            &page.shifted_keys[i].0
+        } else {
+            &page.keys[i].0
+        };
         match &page.blink[i] {
-            Some((alternate, interval)) if blink::alternate(self.blink_epoch, now, *interval) => {
-                alternate
+            Some(spec) if blink::alternate(self.blink_epoch, now, spec.interval) => {
+                spec.alternate(face)
             }
-            _ => &page.keys[i].0,
+            _ => face.clone(),
         }
     }
 
@@ -294,7 +313,7 @@ impl Runner {
             .blink
             .iter()
             .flatten()
-            .map(|(_, interval)| blink::next_flip(self.blink_epoch, now, *interval))
+            .map(|spec| blink::next_flip(self.blink_epoch, now, spec.interval))
             .min()
     }
 
@@ -340,7 +359,15 @@ impl Runner {
     /// The long-press action `button` has on the current page, if any.
     fn long_action(&self, button: Button) -> Option<Action> {
         match button {
-            Button::Key(n) => self.setup.pages[self.page].long[usize::from(n) - 1].clone(),
+            Button::Key(n) => {
+                let page = &self.setup.pages[self.page];
+                let long = if self.shift.active() {
+                    &page.shifted_long
+                } else {
+                    &page.long
+                };
+                long[usize::from(n) - 1].clone()
+            }
             Button::PageLeft | Button::PageRight => None,
         }
     }
@@ -364,7 +391,7 @@ impl Runner {
         {
             self.press(keypad, button, &action)?;
         }
-        self.release(button)
+        self.release(keypad, button)
     }
 
     /// Fire the long-press actions of keys held past the threshold.
@@ -378,9 +405,15 @@ impl Runner {
     /// The action `button` has on the current page.
     fn action(&self, button: Button) -> Action {
         match button {
-            Button::Key(n) => self.setup.pages[self.page].keys[usize::from(n) - 1]
-                .1
-                .clone(),
+            Button::Key(n) => {
+                let page = &self.setup.pages[self.page];
+                let keys = if self.shift.active() {
+                    &page.shifted_keys
+                } else {
+                    &page.keys
+                };
+                keys[usize::from(n) - 1].1.clone()
+            }
             Button::PageLeft => self.setup.left.clone(),
             Button::PageRight => self.setup.right.clone(),
         }
@@ -388,6 +421,25 @@ impl Runner {
 
     /// `button` went down with `action` bound to it.
     fn press(&mut self, keypad: &mut Keypad, button: Button, action: &Action) -> Result<()> {
+        if let Action::Shift(mode) = action {
+            self.shift.press(button, shift::Mode::parse(mode)?);
+            return self.show(keypad);
+        }
+        let result = self.perform_action(keypad, button, action);
+        // A `once` shift is spent by the next grid key, whatever it did.
+        if matches!(button, Button::Key(_)) && self.shift.consume() {
+            self.show(keypad)?;
+        }
+        result
+    }
+
+    /// Do what `action` says, for `button`.
+    fn perform_action(
+        &mut self,
+        keypad: &mut Keypad,
+        button: Button,
+        action: &Action,
+    ) -> Result<()> {
         match action {
             Action::Page(_) => {
                 if let Some(to) = self.setup.target(self.page, action) {
@@ -433,7 +485,10 @@ impl Runner {
     }
 
     /// `button` came up: let go of whatever its press is holding.
-    fn release(&mut self, button: Button) -> Result<()> {
+    fn release(&mut self, keypad: &mut Keypad, button: Button) -> Result<()> {
+        if self.shift.release(button) {
+            self.show(keypad)?;
+        }
         match self.held.remove(&button) {
             Some(held) => held.release(),
             None => Ok(()),
@@ -443,6 +498,7 @@ impl Runner {
     /// Let go of everything held, when the session ends.
     fn release_all(&mut self) {
         self.long.clear();
+        self.shift.clear();
         for (_, held) in self.held.drain() {
             if let Err(error) = held.release() {
                 log!("{error:#}");
@@ -487,7 +543,9 @@ enum Step {
 /// handled by [`Runner::press`] and never get here.
 fn prepare(action: &Action) -> Result<Step> {
     Ok(match action {
-        Action::None | Action::Page(_) | Action::Hold(_) | Action::Switch(_) => Step::Nothing,
+        Action::None | Action::Page(_) | Action::Hold(_) | Action::Switch(_) | Action::Shift(_) => {
+            Step::Nothing
+        }
         Action::Sequence(_) => anyhow::bail!("a sequence cannot contain a sequence"),
         Action::Run(command) => Step::Run(command.clone()),
         Action::Open(target) => Step::Open(open_args(target)),
@@ -577,6 +635,7 @@ fn run(path: &Path) -> Result<()> {
         held: HashMap::new(),
         long: LongPress::new(setup_long_press),
         blink_epoch: Instant::now(),
+        shift: Shift::default(),
     };
     let mut api = HidApi::new()?;
     let mut waiting = false;

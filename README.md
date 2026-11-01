@@ -161,12 +161,13 @@ This example uses one page and nine keys. Save it as a JSON file and pass its pa
 | `pages[].name` | Required, unique page name. Use it as a page action's target. |
 | `pages[].keys` | Optional object mapping key numbers `"1"`–`"9"` to key settings, in row-major order from the top left. Omitted keys have the default background and no icon, label, or action. |
 | `pages[].keys.<key>.icon` | Optional built-in name from `mx-keypad icons`, or a path to an `.svg`, `.png`, `.jpg`, or `.jpeg` file. Relative paths resolve from the config file's directory; `~/` resolves from `HOME`. SVG `currentColor` uses the foreground color. |
-| `pages[].keys.<key>.label` | Optional text drawn near the bottom of the key. Labels use system fonts. |
+| `pages[].keys.<key>.label` | Optional text drawn near the bottom of the key. On a key without an icon, the label is the face: large and centred, sized by `glyph_scale`. Labels use system fonts. |
 | `pages[].keys.<key>.background` | Optional background color; overrides `defaults.background`. |
 | `pages[].keys.<key>.foreground` | Optional icon and label color; overrides `defaults.foreground`. PNG and JPEG icons keep their own colors. |
 | `pages[].keys.<key>.glyph_scale` | Optional icon size, from `0.05` to `1.0`; overrides `defaults.glyph_scale`. |
 | `pages[].keys.<key>.action` | Optional action from the table below. Defaults to `"none"`. |
 | `pages[].keys.<key>.long_press` | Optional action to perform instead of `action` when the key is held for at least `defaults.long_press_ms`. |
+| `pages[].keys.<key>.shifted` | Optional. What the key shows and does while shift is on. Takes `icon`, `label`, `background`, `foreground`, `glyph_scale`, `action` and `long_press`; each one you leave out follows the key's own, shifted automatically (see below). |
 | `pages[].keys.<key>.blink` | Optional. Makes the key blink between its face and one with `background` (default `#000000`) and `foreground` (default: the key's own). Each face shows for `interval_ms`, from `200` to `10000`; default `500`, which is 1 Hz. |
 | `page_buttons.left` | Optional action for the left page button. Default: `{ "page": "prev" }`. |
 | `page_buttons.right` | Optional action for the right page button. Default: `{ "page": "next" }`. |
@@ -183,6 +184,32 @@ page doesn't restart them. For example, a blue key that flashes black once a sec
 ```json
 "2": { "icon": "volume-x", "background": "#0000FF", "blink": {}, "action": { "media": "mute" } }
 ```
+
+### Shift
+
+A key with a `shift` action is the keypad's own shift. While shift is on, every other key uses its
+shifted binding, and the keys redraw to show it. The shift key itself shows its colours swapped, so
+you can see when shift is latched. Keys you don't give a `shifted` field are shifted automatically:
+
+| Action | While shift is on |
+| --- | --- |
+| `text` | Typed in upper case: `æ` types `Æ`. The key's label is shown in upper case too. |
+| `keys`, `hold`, `switch` | The same shortcut with `shift` added, unless it already has it. |
+| `sequence` | Its `text` and `keys` steps are shifted. |
+| Anything else | Unchanged. |
+
+For example, `æ` and `Æ` on one key, a save key that becomes "Save as", and a shift key that
+toggles:
+
+```json
+"4": { "label": "æ", "action": { "text": "æ" } },
+"5": { "label": "Save", "action": { "keys": "cmd+s" },
+       "shifted": { "label": "Save as", "action": { "keys": "cmd+shift+s" } } },
+"8": { "icon": "chevrons-up", "label": "Shift", "action": { "shift": "toggle" } }
+```
+
+A shift key can't have `long_press`, and `shift` can't be a `long_press` or a sequence step. The
+page buttons ignore shift. A `once` shift is spent by the next key press, whatever that key does.
 
 ### Actions
 
@@ -203,10 +230,11 @@ Use the same action formats for keys and page buttons. `delay` is only valid ins
 | System | `{ "system": "lock" }` | Run `sleep`, `display-sleep`, or `lock`. |
 | Sequence | `{ "sequence": [{ "keys": "cmd+a" }, { "delay": 100 }, { "text": "Hello!" }] }` | Run steps in order on a background thread. |
 | Delay | `{ "delay": 100 }` | Wait up to 10,000 milliseconds; only valid inside a sequence. |
+| Shift | `{ "shift": "toggle" }` | Switch the other keys to their shifted bindings: `hold` while held, `toggle` on and off with each tap, or `once` for the next key press. |
 
 `next` and `prev` wrap around the page list. A named page target must exist; `next` and `prev` are
 reserved as navigation targets. A sequence must contain at least one step and can't contain `page`,
-`hold`, `switch`, or another `sequence`. Within a sequence, `run` and `open` wait for their
+`hold`, `switch`, `shift`, or another `sequence`. Within a sequence, `run` and `open` wait for their
 processes to exit before the next step. Outside a sequence, they don't block input. Only use
 configurations and commands you trust. Unknown configuration fields are rejected.
 

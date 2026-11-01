@@ -246,7 +246,10 @@ pub fn render_tile(face: &Face, size: u16) -> Result<KeyImageJpeg, RenderError> 
         }
     }
     if let Some(label) = face.label.as_deref().filter(|s| !s.is_empty()) {
-        draw_label(&mut pixmap, label, face.foreground)?;
+        // Without an icon the label is the key's face: drawn large and
+        // centred, so a letter key reads like a keycap.
+        let centred = face.icon.is_none().then_some(fraction);
+        draw_label(&mut pixmap, label, face.foreground, centred)?;
     }
     encode(&pixmap, size)
 }
@@ -323,7 +326,14 @@ fn fontdb() -> &'static Arc<usvg::fontdb::Database> {
     })
 }
 
-fn draw_label(pixmap: &mut tiny_skia::Pixmap, label: &str, colour: Rgb) -> Result<(), RenderError> {
+/// Draw `label` under the icon, or, with `centred` set to a glyph scale, as
+/// the whole face: as tall as that share of the tile, shrunk to fit its width.
+fn draw_label(
+    pixmap: &mut tiny_skia::Pixmap,
+    label: &str,
+    colour: Rgb,
+    centred: Option<f32>,
+) -> Result<(), RenderError> {
     // XML markup is not allowed in labels; discard characters XML cannot represent.
     let text = label.chars().filter(|&c| matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}'))
         .fold(String::new(), |mut out, c| {
@@ -334,9 +344,23 @@ fn draw_label(pixmap: &mut tiny_skia::Pixmap, label: &str, colour: Rgb) -> Resul
             out
         });
     let side = pixmap.width();
+    #[allow(clippy::cast_precision_loss)]
+    let (font_size, baseline) = match centred {
+        Some(scale) => {
+            // Allow 0.85 em per character, enough for wide letters such as Æ
+            // and W; keep the line inside
+            // 90 % of the tile, and drop the baseline by about a third of
+            // the size so capitals sit centred.
+            let chars = label.chars().count().max(1) as f32;
+            let size =
+                (side as f32 * scale.clamp(0.05, 1.0)).min(side as f32 * 0.9 / (chars * 0.85));
+            (size, side as f32 / 2.0 + size * 0.35)
+        }
+        None => (side as f32 * 0.16, side as f32 * 0.88),
+    };
     let svg = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{side}\" height=\"{side}\"><text x=\"50%\" y=\"88%\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"{}\" fill=\"{}\">{text}</text></svg>",
-        side as f32 * 0.16, colour.hex(),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{side}\" height=\"{side}\"><text x=\"50%\" y=\"{baseline}\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"{font_size}\" fill=\"{}\">{text}</text></svg>",
+        colour.hex(),
     );
     let options = usvg::Options {
         fontdb: Arc::clone(fontdb()),
