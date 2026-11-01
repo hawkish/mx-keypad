@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hidapi::HidApi;
 
+use mx_keypad::blink;
 use mx_keypad::config::{self, Action, Setup};
 use mx_keypad::geometry::DISPLAY;
 use mx_keypad::keys::{self, Chord};
@@ -198,6 +199,16 @@ fn check(path: &Path, out: Option<&Path>) -> Result<()> {
                     tile.as_bytes(),
                 )?;
             }
+            if let Some((alternate, _)) = &page.blink[i] {
+                let tile = render::render_tile(alternate, DISPLAY.key_size)
+                    .with_context(|| format!("page {:?} key {} blink", page.name, i + 1))?;
+                if let Some(out) = out {
+                    std::fs::write(
+                        out.join(format!("{}-{}-blink.jpg", page.name, i + 1)),
+                        tile.as_bytes(),
+                    )?;
+                }
+            }
         }
     }
     println!(
@@ -235,6 +246,8 @@ struct Runner {
     held: HashMap<Button, Held>,
     /// Keys with a long-press action, down and not yet decided.
     long: LongPress<Button, Action>,
+    /// The shared start every blinking key counts its phase from.
+    blink_epoch: Instant,
 }
 
 impl Runner {
@@ -242,14 +255,16 @@ impl Runner {
     /// skips keys that already show theirs. A key that fails does not stop
     /// the others; the first failure is returned once all were tried.
     fn show(&mut self, keypad: &mut Keypad) -> Result<()> {
+        let now = Instant::now();
         let mut first_error = None;
-        for (i, (face, _)) in self.setup.pages[self.page].keys.iter().enumerate() {
+        for i in 0..self.setup.pages[self.page].keys.len() {
+            let face = self.face(i, now).clone();
             // `Face` holds an f32, so it is keyed by its full Debug form.
             let key = format!("{face:?}");
             let tile = match self.tiles.get(&key) {
                 Some(tile) => tile.clone(),
                 None => {
-                    let tile = render::render_tile(face, DISPLAY.key_size)?;
+                    let tile = render::render_tile(&face, DISPLAY.key_size)?;
                     self.tiles.insert(key, tile.clone());
                     tile
                 }
@@ -259,6 +274,28 @@ impl Runner {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// The face key `i` (0-based) of the current page shows at `now`: its
+    /// blink face during a blinking key's alternate phase.
+    fn face(&self, i: usize, now: Instant) -> &Face {
+        let page = &self.setup.pages[self.page];
+        match &page.blink[i] {
+            Some((alternate, interval)) if blink::alternate(self.blink_epoch, now, *interval) => {
+                alternate
+            }
+            _ => &page.keys[i].0,
+        }
+    }
+
+    /// When the next blinking key on the current page flips, if any blinks.
+    fn next_flip(&self, now: Instant) -> Option<Instant> {
+        self.setup.pages[self.page]
+            .blink
+            .iter()
+            .flatten()
+            .map(|(_, interval)| blink::next_flip(self.blink_epoch, now, *interval))
+            .min()
     }
 
     /// Take the page buttons over only when the setup uses them.
@@ -539,6 +576,7 @@ fn run(path: &Path) -> Result<()> {
         tiles: HashMap::new(),
         held: HashMap::new(),
         long: LongPress::new(setup_long_press),
+        blink_epoch: Instant::now(),
     };
     let mut api = HidApi::new()?;
     let mut waiting = false;
@@ -601,10 +639,15 @@ fn session(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Resul
 /// Act on presses and config changes until `stop` is set.
 fn serve(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
-        // Wake in time for a long press to fire while the key is held.
-        let timeout = runner.long.next_deadline().map_or(TICK, |at| {
-            at.saturating_duration_since(Instant::now()).min(TICK)
-        });
+        // Wake in time for a long press to fire while the key is held, and
+        // for the next blink.
+        let now = Instant::now();
+        let flip = runner.next_flip(now);
+        let wake = [runner.long.next_deadline(), flip]
+            .into_iter()
+            .flatten()
+            .min();
+        let timeout = wake.map_or(TICK, |at| at.saturating_duration_since(now).min(TICK));
         for event in poll(keypad, stop, timeout)? {
             let result = match event {
                 Event::Down(button) => runner.down(keypad, button),
@@ -616,6 +659,11 @@ fn serve(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<
         }
         if let Err(error) = runner.tick(keypad) {
             log!("{error:#}");
+        }
+        if flip.is_some_and(|at| Instant::now() >= at) {
+            if let Err(error) = runner.show(keypad) {
+                log!("blink: {error:#}");
+            }
         }
         runner
             .children

@@ -122,7 +122,33 @@ pub struct Key {
     /// key with one acts on release when tapped.
     #[serde(default)]
     pub long_press: Option<Action>,
+    /// Make the key blink between its face and these colours.
+    #[serde(default)]
+    pub blink: Option<Blink>,
 }
+
+/// A blinking key's alternate colours and pace.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Blink {
+    /// Background of the alternate face.
+    #[serde(default = "black")]
+    pub background: Rgb,
+    /// Icon and label colour of the alternate face; the key's own when absent.
+    #[serde(default)]
+    pub foreground: Option<Rgb>,
+    /// How long each face shows.
+    #[serde(default = "blink_ms")]
+    pub interval_ms: u64,
+}
+
+/// Each face of a blinking key shows this long by default: 1 Hz.
+fn blink_ms() -> u64 {
+    500
+}
+
+/// The fastest and slowest blink allowed, in milliseconds.
+pub const BLINK_RANGE_MS: std::ops::RangeInclusive<u64> = 200..=10_000;
 
 /// What pressing a key does.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -243,6 +269,8 @@ pub struct ResolvedPage {
     pub keys: [(Face, Action); 9],
     /// Their long-press actions, where they have one.
     pub long: [Option<Action>; 9],
+    /// Blinking keys' alternate face and interval.
+    pub blink: [Option<(Face, std::time::Duration)>; 9],
 }
 
 impl Setup {
@@ -311,6 +339,7 @@ impl Setup {
                 )
             });
             let mut long: [Option<Action>; 9] = Default::default();
+            let mut blink: [Option<(Face, std::time::Duration)>; 9] = Default::default();
             for (index, key) in &page.keys {
                 let at = format!("pages[{p}].keys.{index:?}");
                 let slot = index
@@ -352,9 +381,28 @@ impl Setup {
                     key.action.clone(),
                 );
                 long[slot - 1].clone_from(&key.long_press);
+                if let Some(b) = &key.blink {
+                    if !BLINK_RANGE_MS.contains(&b.interval_ms) {
+                        bail!(
+                            "{at}.blink.interval_ms: {} is outside {}–{}",
+                            b.interval_ms,
+                            BLINK_RANGE_MS.start(),
+                            BLINK_RANGE_MS.end()
+                        );
+                    }
+                    let face = &keys[slot - 1].0;
+                    let alternate = Face {
+                        background: b.background,
+                        foreground: b.foreground.unwrap_or(face.foreground),
+                        ..face.clone()
+                    };
+                    blink[slot - 1] =
+                        Some((alternate, std::time::Duration::from_millis(b.interval_ms)));
+                }
             }
             pages.push(ResolvedPage {
                 long,
+                blink,
                 name: page.name.clone(),
                 keys,
             });
@@ -574,6 +622,32 @@ mod tests {
                 "1": { "long_press": { "page": "nowhere" } } } }] }"#
         )
         .contains("long_press"));
+    }
+
+    #[test]
+    fn blinking_keys_get_an_alternate_face() {
+        let setup = setup(
+            r##"{ "pages": [{ "name": "a", "keys": {
+                "1": { "icon": "bell", "background": "#0000ff", "foreground": "#ffff00",
+                       "blink": {} },
+                "2": { "blink": { "background": "#ff0000", "foreground": "#000000",
+                                  "interval_ms": 250 } }
+            } }] }"##,
+        )
+        .unwrap();
+        let (face, interval) = setup.pages[0].blink[0].clone().unwrap();
+        assert_eq!(interval, std::time::Duration::from_millis(500));
+        assert_eq!(face.background, Rgb(0, 0, 0));
+        assert_eq!(face.foreground, Rgb(0xff, 0xff, 0));
+        assert_eq!(face.icon, setup.pages[0].keys[0].0.icon);
+        let (face, interval) = setup.pages[0].blink[1].clone().unwrap();
+        assert_eq!(interval, std::time::Duration::from_millis(250));
+        assert_eq!(face.foreground, Rgb(0, 0, 0));
+        assert!(setup.pages[0].blink[2].is_none());
+        assert!(error(
+            r#"{ "pages": [{ "name": "a", "keys": { "1": { "blink": { "interval_ms": 50 } } } }] }"#
+        )
+        .contains("blink.interval_ms"));
     }
 
     #[test]

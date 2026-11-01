@@ -5,6 +5,7 @@
 //! against blocking `hidapi`; see `PROTOCOL.md`. [`config`] reads the JSON
 //! setup the `mx-keypad` binary runs.
 
+pub mod blink;
 pub mod config;
 pub mod device;
 pub mod geometry;

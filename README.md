@@ -167,6 +167,7 @@ This example uses one page and nine keys. Save it as a JSON file and pass its pa
 | `pages[].keys.<key>.glyph_scale` | Optional icon size, from `0.05` to `1.0`; overrides `defaults.glyph_scale`. |
 | `pages[].keys.<key>.action` | Optional action from the table below. Defaults to `"none"`. |
 | `pages[].keys.<key>.long_press` | Optional action to perform instead of `action` when the key is held for at least `defaults.long_press_ms`. |
+| `pages[].keys.<key>.blink` | Optional. Makes the key blink between its face and one with `background` (default `#000000`) and `foreground` (default: the key's own). Each face shows for `interval_ms`, from `200` to `10000`; default `500`, which is 1 Hz. |
 | `page_buttons.left` | Optional action for the left page button. Default: `{ "page": "prev" }`. |
 | `page_buttons.right` | Optional action for the right page button. Default: `{ "page": "next" }`. |
 
@@ -174,6 +175,14 @@ For a key with `long_press`, a short tap runs `action` on release; holding it to
 runs `long_press` once, instead. The key shows its normal face for both actions. A key with
 `long_press` can't use `hold` or `switch` for either action. Keys without `long_press` act on
 press.
+
+A blinking key is redrawn at every interval, since the keypad can't blink by itself. All blinking
+keys count from the same moment, so keys with the same interval switch together, and changing
+page doesn't restart them. For example, a blue key that flashes black once a second:
+
+```json
+"2": { "icon": "volume-x", "background": "#0000FF", "blink": {}, "action": { "media": "mute" } }
+```
 
 ### Actions
 
