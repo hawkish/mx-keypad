@@ -231,6 +231,26 @@ nix develop -c cargo test
 nix develop -c cargo clippy --all-targets -- -D warnings
 ```
 
+### Make a release
+
+Releases are built on a Mac outside the Nix shell, so the binary only loads system libraries. You
+need Xcode, Homebrew `rustup` with the `aarch64-apple-darwin` and `x86_64-apple-darwin` targets,
+and a Developer ID Application identity in your keychain. Store your notarization credentials once:
+
+```sh
+xcrun notarytool store-credentials mx-keypad --apple-id <apple-id> --team-id <team-id>
+```
+
+Then set the version in `Cargo.toml`, commit, and run one of these:
+
+```sh
+scripts/release.sh dist       # universal binary, Developer ID signed, zipped into dist/
+scripts/release.sh notarize   # dist, then notarize the zip with Apple
+scripts/release.sh publish    # notarize, then tag v<version> and create the GitHub release
+```
+
+`mx-keypad install` keeps a release's Developer ID signature instead of re-signing it.
+
 The protocol code is ported from OpenLogi. See [NOTICE](NOTICE) for attribution and licenses and
 [PROTOCOL.md](PROTOCOL.md) for the device protocol. mx-keypad is licensed under MIT or Apache-2.0.
 ```

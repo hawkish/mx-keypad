@@ -146,7 +146,29 @@ fn pick_identity(listing: &str) -> Option<String> {
         .map(|(hash, _)| (*hash).to_string())
 }
 
-/// Copy the running executable to [`installed_exe`] and sign it.
+/// Whether `path` carries a valid signature from a Developer ID Application
+/// certificate, as a release build does.
+fn developer_id_signed(path: &Path) -> bool {
+    let valid = Command::new("codesign")
+        .args(["--verify", "--strict"])
+        .arg(path)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    valid
+        && Command::new("codesign")
+            .args(["-dv", "--verbose=2"])
+            .arg(path)
+            .output()
+            .is_ok_and(|out| {
+                String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .any(|line| line.starts_with("Authority=Developer ID Application:"))
+            })
+}
+
+/// Copy the running executable to [`installed_exe`] and sign it, unless it
+/// is a Developer ID-signed release.
 fn install_exe(identity: Option<&str>) -> Result<PathBuf> {
     let source = std::env::current_exe()
         .and_then(std::fs::canonicalize)
@@ -163,6 +185,16 @@ fn install_exe(identity: Option<&str>) -> Result<PathBuf> {
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
     std::fs::set_permissions(&staged, perms)?;
 
+    // A release is already signed with Developer ID: keep that signature,
+    // which every Mac recognises, unless an identity was asked for.
+    if identity.is_none() && developer_id_signed(&staged) {
+        std::fs::rename(&staged, &target)?;
+        println!(
+            "installed {} with its Developer ID signature",
+            target.display()
+        );
+        return Ok(target);
+    }
     let identity = signing_identity(identity)?;
     let sign_with = identity.as_deref().unwrap_or("-");
     let status = Command::new("codesign")
