@@ -52,7 +52,8 @@ mx-keypad run --config examples/demo.json
 `run` shows the first page, executes actions on press, and checks for configuration changes. If a
 changed file fails validation, it reports the error and keeps the previous configuration. Both
 `run` and `events` take over the page buttons while active and attempt to return them to the
-firmware on exit, including Ctrl-C and SIGTERM.
+firmware on exit, including Ctrl-C and SIGTERM. When `run` stops, it also blanks all nine keys, so an image
+left on the panel never looks like a live key.
 
 Use the other commands to check a configuration, draw a tile, or inspect input:
 

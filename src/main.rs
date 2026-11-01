@@ -258,8 +258,17 @@ fn run(path: &Path) -> Result<()> {
     }
     runner.show(&mut keypad)?;
 
+    let served = serve(&mut runner, &mut keypad, &stop);
+    // Blank the keys on the way out, whatever ended the loop: images left
+    // behind would look live while nothing answers the presses.
+    let cleared = keypad.clear();
+    served.and(cleared)
+}
+
+/// Act on presses and config changes until `stop` is set.
+fn serve(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
-        for event in poll(&mut keypad, &stop)? {
+        for event in poll(keypad, stop)? {
             let Event::Down(button) = event else { continue };
             let action = match button {
                 Button::Key(n) => runner.setup.pages[runner.page].keys[usize::from(n) - 1]
@@ -268,14 +277,14 @@ fn run(path: &Path) -> Result<()> {
                 Button::PageLeft => runner.setup.left.clone(),
                 Button::PageRight => runner.setup.right.clone(),
             };
-            if let Err(error) = runner.act(&mut keypad, &action) {
+            if let Err(error) = runner.act(keypad, &action) {
                 eprintln!("{error:#}");
             }
         }
         runner
             .children
             .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
-        runner.reload(&mut keypad)?;
+        runner.reload(keypad)?;
     }
     Ok(())
 }

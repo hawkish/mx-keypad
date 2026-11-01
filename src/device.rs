@@ -13,6 +13,7 @@ use crate::geometry::{PanelPoint, DISPLAY, PRODUCT_ID, VENDOR_ID};
 use crate::hidpp::{self, Link, BRIGHTNESS_CONTROL, REPROG_CONTROLS_V4};
 use crate::image::{ack_part, image_ack, image_packets, KeyImageJpeg, ACK_TIMEOUT};
 use crate::input::{Decoder, Event, LEFT_PAGING, RIGHT_PAGING};
+use crate::render;
 
 /// The vendor node's usage page and usage.
 const USAGE_PAGE: u16 = 0xff43;
@@ -64,6 +65,16 @@ impl Keypad {
         let result = write_image(&self.handle, origin, image, &mut stray);
         self.absorb(stray);
         result
+    }
+
+    /// Blank all nine keys. The panel keeps whatever was drawn last, so a
+    /// program that stops answering presses should clear it.
+    pub fn clear(&mut self) -> Result<()> {
+        let blank = render::render_tile(&render::Face::default(), DISPLAY.key_size)?;
+        for index in 1..=DISPLAY.grid.rows * DISPLAY.grid.cols {
+            self.draw(u8::try_from(index)?, &blank)?;
+        }
+        Ok(())
     }
 
     /// Set the panel brightness to `percent` of its range, 1–100. Never 0:
