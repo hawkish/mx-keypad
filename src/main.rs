@@ -251,6 +251,7 @@ impl Runner {
             }
             Action::Keys(chord) => keys::send_chord(Chord::parse(chord)?)?,
             Action::Text(text) => keys::type_text(text)?,
+            Action::Media(name) => keys::send_media(keys::MediaKey::parse(name)?)?,
             Action::Page(_) => {
                 if let Some(to) = self.setup.target(self.page, action) {
                     if to != self.page {

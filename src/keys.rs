@@ -131,6 +131,61 @@ pub fn type_text(text: &str) -> Result<()> {
     platform::type_text(text)
 }
 
+/// A media key, as the keyboard's top row sends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKey {
+    /// Toggle mute.
+    Mute,
+    /// Volume up a step.
+    VolumeUp,
+    /// Volume down a step.
+    VolumeDown,
+    /// Play or pause.
+    PlayPause,
+    /// Next track.
+    Next,
+    /// Previous track.
+    Previous,
+}
+
+impl MediaKey {
+    /// Parse a media key name: `mute`, `volume-up`, `volume-down`,
+    /// `play-pause`, `next` or `previous`.
+    pub fn parse(name: &str) -> Result<MediaKey> {
+        Ok(match name.to_ascii_lowercase().as_str() {
+            "mute" => MediaKey::Mute,
+            "volume-up" => MediaKey::VolumeUp,
+            "volume-down" => MediaKey::VolumeDown,
+            "play-pause" | "play" => MediaKey::PlayPause,
+            "next" => MediaKey::Next,
+            "previous" | "prev" => MediaKey::Previous,
+            _ => bail!(
+                "{name:?}: media keys are mute, volume-up, volume-down, play-pause, next and previous"
+            ),
+        })
+    }
+
+    /// The `NX_KEYTYPE_*` code macOS gives the key.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    const fn nx_code(self) -> isize {
+        match self {
+            MediaKey::VolumeUp => 0,
+            MediaKey::VolumeDown => 1,
+            MediaKey::Mute => 7,
+            MediaKey::PlayPause => 16,
+            MediaKey::Next => 17,
+            MediaKey::Previous => 18,
+        }
+    }
+}
+
+/// Press and release a media key. Unlike scripting the volume, this is the
+/// key the keyboard sends, so it shows the system HUD and reaches every
+/// output device the hardware key would.
+pub fn send_media(key: MediaKey) -> Result<()> {
+    platform::send_media(key)
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use anyhow::{anyhow, bail, Result};
@@ -197,6 +252,70 @@ mod platform {
         Ok(())
     }
 
+    /// `NSPoint`, for `otherEventWithType:…`'s location argument.
+    #[repr(C)]
+    struct Point {
+        x: f64,
+        y: f64,
+    }
+
+    // SAFETY: the layout matches CGPoint's `{CGPoint=dd}` encoding.
+    unsafe impl objc2::Encode for Point {
+        const ENCODING: objc2::Encoding =
+            objc2::Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+    }
+
+    #[link(name = "AppKit", kind = "framework")]
+    extern "C" {}
+
+    extern "C" {
+        fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
+    }
+
+    pub(super) fn send_media(key: super::MediaKey) -> Result<()> {
+        use objc2::runtime::AnyObject;
+        use objc2::{class, msg_send};
+
+        require_trust()?;
+        // A media key is an NSSystemDefined event (type 14) of subtype 8
+        // (NX_SUBTYPE_AUX_CONTROL_BUTTONS): data1 holds the key code in its
+        // high half and the key state (0xa down, 0xb up) above the low byte.
+        for state in [0xa_isize, 0xb] {
+            objc2::rc::autoreleasepool(|_| {
+                let data1 = (key.nx_code() << 16) | (state << 8);
+                // SAFETY: a documented NSEvent class method; every argument
+                // has the type its selector declares.
+                let event: *mut AnyObject = unsafe {
+                    msg_send![
+                        class!(NSEvent),
+                        otherEventWithType: 14_usize,
+                        location: Point { x: 0.0, y: 0.0 },
+                        modifierFlags: (state << 8) as usize,
+                        timestamp: 0.0_f64,
+                        windowNumber: 0_isize,
+                        context: std::ptr::null_mut::<AnyObject>(),
+                        subtype: 8_i16,
+                        data1: data1,
+                        data2: -1_isize
+                    ]
+                };
+                if event.is_null() {
+                    bail!("cannot create a media key event");
+                }
+                // SAFETY: `event` is a live NSEvent within this pool.
+                let cg: *mut std::ffi::c_void = unsafe { msg_send![event, CGEvent] };
+                if cg.is_null() {
+                    bail!("cannot convert the media key event");
+                }
+                // SAFETY: `cg` is a valid CGEventRef owned by `event`;
+                // 0 is kCGHIDEventTap.
+                unsafe { CGEventPost(0, cg) };
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
     pub(super) fn type_text(text: &str) -> Result<()> {
         require_trust()?;
         // One character per event pair: apps that read the key code rather
@@ -233,6 +352,10 @@ mod platform {
     pub(super) fn type_text(_text: &str) -> Result<()> {
         bail!("sending keystrokes is only supported on macOS")
     }
+
+    pub(super) fn send_media(_key: super::MediaKey) -> Result<()> {
+        bail!("sending keystrokes is only supported on macOS")
+    }
 }
 
 #[cfg(test)]
@@ -263,6 +386,14 @@ mod tests {
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(codes.len(), 36);
+    }
+
+    #[test]
+    fn media_keys_parse_their_names() {
+        assert_eq!(MediaKey::parse("Mute").unwrap(), MediaKey::Mute);
+        assert_eq!(MediaKey::parse("volume-up").unwrap().nx_code(), 0);
+        assert_eq!(MediaKey::parse("prev").unwrap(), MediaKey::Previous);
+        assert!(MediaKey::parse("louder").is_err());
     }
 
     #[test]

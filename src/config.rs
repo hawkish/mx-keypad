@@ -127,13 +127,16 @@ pub enum Action {
     Keys(String),
     /// Type a string (macOS).
     Text(String),
+    /// Press a media key: `mute`, `volume-up`, `volume-down`, `play-pause`,
+    /// `next` or `previous` (macOS).
+    Media(String),
 }
 
 impl Action {
     /// Whether the action sends keystrokes, which needs Accessibility.
     #[must_use]
     pub fn sends_keys(&self) -> bool {
-        matches!(self, Action::Keys(_) | Action::Text(_))
+        matches!(self, Action::Keys(_) | Action::Text(_) | Action::Media(_))
     }
 }
 
@@ -308,6 +311,9 @@ fn check_action(action: &Action, names: &[&str], at: &str) -> Result<()> {
         }
         Action::Run(command) if command.trim().is_empty() => bail!("{at}: empty command"),
         Action::Text(text) if text.is_empty() => bail!("{at}: empty text"),
+        Action::Media(name) => crate::keys::MediaKey::parse(name)
+            .map(drop)
+            .with_context(|| format!("{at}.media")),
         Action::Keys(chord) => crate::keys::Chord::parse(chord)
             .map(drop)
             .with_context(|| format!("{at}.keys")),
