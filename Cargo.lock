@@ -515,6 +515,7 @@ dependencies = [
  "core-graphics",
  "hidapi",
  "image",
+ "libc",
  "objc2",
  "resvg",
  "serde",

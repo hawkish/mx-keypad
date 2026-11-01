@@ -18,6 +18,13 @@ use mx_keypad::press::{Fire, LongPress};
 use mx_keypad::render::{self, Face, Rgb};
 use mx_keypad::{Button, Event, KeyImageJpeg, Keypad};
 
+/// `eprintln!` with the local time in front, for the agent's log.
+macro_rules! log {
+    ($($arg:tt)*) => {
+        eprintln!("{} {}", crate::timestamp(), format_args!($($arg)*))
+    };
+}
+
 #[cfg(target_os = "macos")]
 mod service;
 
@@ -283,11 +290,11 @@ impl Runner {
                 if let Some(level) = self.setup.brightness {
                     keypad.set_brightness(level)?;
                 }
-                eprintln!("reloaded {}", self.path.display());
+                log!("reloaded {}", self.path.display());
                 self.show(keypad)
             }
             Err(error) => {
-                eprintln!("{error:#}; keeping the previous setup");
+                log!("{error:#}; keeping the previous setup");
                 Ok(())
             }
         }
@@ -373,7 +380,7 @@ impl Runner {
                 std::thread::spawn(move || {
                     for step in &steps {
                         if let Err(error) = perform(step, true) {
-                            eprintln!("sequence stopped: {error:#}");
+                            log!("sequence stopped: {error:#}");
                             break;
                         }
                     }
@@ -401,7 +408,7 @@ impl Runner {
         self.long.clear();
         for (_, held) in self.held.drain() {
             if let Err(error) = held.release() {
-                eprintln!("{error:#}");
+                log!("{error:#}");
             }
         }
     }
@@ -517,7 +524,7 @@ fn run(path: &Path) -> Result<()> {
     service::trim_log();
     let setup = Setup::load(path)?;
     if setup.sends_keys() && !keys::trusted(true) {
-        eprintln!(
+        log!(
             "keystroke keys need Accessibility: allow mx-keypad under System Settings → \
              Privacy & Security → Accessibility; they fail until then"
         );
@@ -540,7 +547,7 @@ fn run(path: &Path) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
         let Some(mut keypad) = Keypad::open(&api)? else {
             if !waiting {
-                eprintln!("waiting for the MX Creative Keypad (USB)");
+                log!("waiting for the MX Creative Keypad (USB)");
                 waiting = true;
             }
             if sleep_unless_stopped(Duration::from_secs(1), &stop) {
@@ -550,7 +557,7 @@ fn run(path: &Path) -> Result<()> {
             continue;
         };
         if waiting {
-            eprintln!("keypad connected");
+            log!("keypad connected");
             waiting = false;
         }
         let started = Instant::now();
@@ -571,7 +578,7 @@ fn run(path: &Path) -> Result<()> {
         }
         failures = (failures + 1).min(5);
         let delay = Duration::from_secs(1 << failures);
-        eprintln!("{error:#}; reconnecting in {}s", delay.as_secs());
+        log!("{error:#}; reconnecting in {}s", delay.as_secs());
         if sleep_unless_stopped(delay, &stop) {
             return Ok(());
         }
@@ -604,11 +611,11 @@ fn serve(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<
                 Event::Up(button) => runner.up(keypad, button),
             };
             if let Err(error) = result {
-                eprintln!("{error:#}");
+                log!("{error:#}");
             }
         }
         if let Err(error) = runner.tick(keypad) {
-            eprintln!("{error:#}");
+            log!("{error:#}");
         }
         runner
             .children
@@ -639,9 +646,41 @@ fn sleep_unless_stopped(delay: Duration, stop: &AtomicBool) -> bool {
     stop.load(Ordering::Relaxed)
 }
 
+/// The local time as `YYYY-MM-DD HH:MM:SS`.
+fn timestamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let secs = libc::time_t::try_from(now).unwrap_or_default();
+    // SAFETY: `localtime_r` writes into the `tm` we own and reads `secs`.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        return format!("@{now}");
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::open_args;
+    use super::{open_args, timestamp};
+
+    #[test]
+    fn timestamps_read_as_local_date_and_time() {
+        let stamp = timestamp();
+        let shape: String = stamp
+            .chars()
+            .map(|c| if c.is_ascii_digit() { '9' } else { c })
+            .collect();
+        assert_eq!(shape, "9999-99-99 99:99:99", "{stamp}");
+    }
 
     #[test]
     fn open_takes_names_as_apps_and_the_rest_as_locations() {

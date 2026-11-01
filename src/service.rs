@@ -40,7 +40,7 @@ pub fn trim_log() {
     }
     if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
         if file.set_len(0).is_ok() {
-            eprintln!("log trimmed: it had grown past {} KiB", LOG_LIMIT / 1024);
+            log!("log trimmed: it had grown past {} KiB", LOG_LIMIT / 1024);
         }
     }
 }
