@@ -2,9 +2,14 @@
   description = "mx-keypad - drive the Logitech MX Creative Keypad's LCD keys from a JSON setup";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  # Rust's own release builds with both Apple targets, for scripts/release.sh.
+  inputs.fenix = {
+    url = "github:nix-community/fenix";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, fenix }:
     let
       systems = [
         "aarch64-darwin"
@@ -40,6 +45,18 @@
             mainProgram = "mx-keypad";
           };
         };
+      }
+      // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+        # Links with Xcode's cc rather than a Nix wrapper, so the universal
+        # binary loads only system libraries.
+        release-toolchain =
+          with fenix.packages.${pkgs.stdenv.hostPlatform.system};
+          combine [
+            stable.cargo
+            stable.rustc
+            targets.aarch64-apple-darwin.stable.rust-std
+            targets.x86_64-apple-darwin.stable.rust-std
+          ];
       });
 
       devShells = forAllSystems (pkgs: {

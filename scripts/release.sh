@@ -5,14 +5,14 @@
 #   scripts/release.sh notarize  dist, then submit the zip to Apple and wait
 #   scripts/release.sh publish   notarize, then tag v$VERSION and create the GitHub release
 #
-# Runs on a Mac with Xcode, Homebrew rustup (both Apple targets) and a
-# Developer ID Application identity in the keychain. Notarizing reads the
+# Runs on a Mac with Nix, Xcode and a Developer ID Application identity in the keychain. Notarizing reads the
 # keychain profile "mx-keypad", stored once with:
 #
 #   xcrun notarytool store-credentials mx-keypad --apple-id <id> --team-id <team>
 #
 # The Nix dev shell points xcrun at its own SDK and links against Nix's
-# libiconv, so the build runs with a clean environment: the result loads only
+# libiconv, so the build runs with a clean environment and the flake's
+# release-toolchain, which links with Xcode's cc: the result loads only
 # system libraries and runs on any Mac from MACOSX_DEPLOYMENT_TARGET up.
 
 set -euo pipefail
@@ -22,9 +22,10 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
 if [[ -z ${MX_KEYPAD_CLEAN_ENV:-} ]]; then
+    toolchain=$(nix build --no-link --print-out-paths "$ROOT#release-toolchain")
     exec env -i \
         HOME="$HOME" USER="${USER:-}" TERM="${TERM:-dumb}" \
-        PATH="/opt/homebrew/opt/rustup/bin:/usr/bin:/bin:/usr/sbin:/sbin:/etc/profiles/per-user/${USER:-}/bin:/opt/homebrew/bin" \
+        PATH="$toolchain/bin:/usr/bin:/bin:/usr/sbin:/sbin:/etc/profiles/per-user/${USER:-}/bin:/opt/homebrew/bin" \
         MX_KEYPAD_CLEAN_ENV=1 \
         "$0" "$@"
 fi
@@ -48,7 +49,7 @@ dist() {
     local id
     id=$(identity)
     [[ -n $id ]] || die "no Developer ID Application identity in the keychain"
-    command -v cargo >/dev/null || die "no cargo on PATH (Homebrew rustup)"
+    command -v cargo >/dev/null || die "no cargo on PATH (the flake's release-toolchain)"
     rm -rf "$DIST" && mkdir -p "$DIST"
     for target in aarch64-apple-darwin x86_64-apple-darwin; do
         cargo build --release --locked --target "$target"

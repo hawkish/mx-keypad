@@ -462,9 +462,10 @@ Config changes don't need a restart: the running agent reloads the file when it 
 
 ### Make a release
 
-Releases are built on a Mac outside the Nix shell, so the binary only loads system libraries. You
-need Xcode, Homebrew `rustup` with the `aarch64-apple-darwin` and `x86_64-apple-darwin` targets,
-and a Developer ID Application identity in your keychain. Store your notarization credentials once:
+Releases are built on a Mac outside the Nix shell, so the binary only loads system libraries. The
+release script builds with the flake's `release-toolchain`, which has the `aarch64-apple-darwin`
+and `x86_64-apple-darwin` targets. You need Nix, Xcode, and a Developer ID Application identity in
+your keychain. Store your notarization credentials once:
 
 ```sh
 xcrun notarytool store-credentials mx-keypad --apple-id <apple-id> --team-id <team-id>
