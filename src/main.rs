@@ -83,6 +83,10 @@ enum Cmd {
         /// Config file [default: ~/.config/mx-keypad/config.json]
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Code-signing identity (SHA-1 or name) [default: the first Apple
+        /// Development identity in the keychain]
+        #[arg(long)]
+        identity: Option<String>,
     },
     /// Stop and remove the LaunchAgent.
     #[cfg(target_os = "macos")]
@@ -121,10 +125,10 @@ fn main() -> Result<()> {
         }
         Cmd::Events => events(),
         #[cfg(target_os = "macos")]
-        Cmd::Install { config } => {
+        Cmd::Install { config, identity } => {
             let path = config.unwrap_or_else(config::default_path);
             Setup::load(&path)?;
-            service::install(&path)
+            service::install(&path, identity.as_deref())
         }
         #[cfg(target_os = "macos")]
         Cmd::Uninstall => service::uninstall(),

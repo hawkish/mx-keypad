@@ -64,19 +64,22 @@ Install `run` as a per-user LaunchAgent. Pass the path to your configuration, or
 to use the default path described below:
 
 ```sh
-~/.nix-profile/bin/mx-keypad install --config "$HOME/.config/mx-keypad/config.json"
+mx-keypad install --config "$HOME/.config/mx-keypad/config.json"
 ```
 
-Replace the executable path if you installed with Cargo or use a different Nix profile. Install
-validates the configuration, then starts the agent. The agent starts at login and restarts if it
-exits, with a 10-second throttle interval. Its label is `dk.mortenhogh.mx-keypad`, its property
-list is `~/Library/LaunchAgents/dk.mortenhogh.mx-keypad.plist`, and its output goes to
+Install validates the configuration, then copies the running executable to
+`~/Library/Application Support/mx-keypad/mx-keypad`, code-signs the copy, and starts the agent
+from that stable path. The agent starts at login and restarts if it exits, with a 10-second
+throttle interval. Its label is `dk.mortenhogh.mx-keypad`, its property list is
+`~/Library/LaunchAgents/dk.mortenhogh.mx-keypad.plist`, and its output goes to
 `~/Library/Logs/mx-keypad.log`.
 
-The agent records the executable path used to start `install` and the resolved configuration path.
-Use a stable path such as a Nix profile or `~/git/mx-keypad/result/bin/mx-keypad` after `nix build`.
-Install warns if the executable path is in `/nix/store`, because garbage collection can remove that
-path. Run `install` again after moving the configuration.
+By default, install signs the copy with the first "Apple Development" identity in your keychain,
+falling back to the first "Developer ID Application" identity, or an ad hoc signature if neither
+exists. Pass `--identity` with a SHA-1 hash or name from `security find-identity -v -p codesigning`
+to choose a different one. Reinstalling with the same identity keeps the same signature, so macOS
+remembers the agent's Accessibility permission across rebuilds; an ad hoc signature asks again
+after every install. `uninstall` removes the installed copy along with the agent.
 
 For keystroke actions, the LaunchAgent lets macOS ask Accessibility permission for mx-keypad
 instead of a terminal or tmux server. See [Keystroke actions](#keystroke-actions-macos). To stop
