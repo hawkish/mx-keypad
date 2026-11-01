@@ -236,6 +236,9 @@ fn read_client(
     tx: &mpsc::Sender<Message>,
     stop: &AtomicBool,
 ) -> Result<()> {
+    // On macOS the stream inherits the listener's O_NONBLOCK, which would
+    // make the read timeouts below return at once.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_millis(100)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -801,6 +804,35 @@ mod tests {
         assert!(!server.has_clients());
         drop(server);
         assert!(!dir.path().exists());
+    }
+
+    #[test]
+    fn a_connection_blocks_on_reads_though_the_listener_does_not() {
+        // BSD sockets inherit O_NONBLOCK from the listener on accept, which
+        // turned every read timeout into an instant WouldBlock: the hello
+        // read failed at once and idle clients spun a core.
+        let dir = Sandbox::new();
+        let _server = Server::bind(dir.path()).unwrap();
+        let mut stream = UnixStream::connect(dir.path()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        write_json(
+            &mut stream,
+            &Request::Hello {
+                client: "slow".into(),
+                protocol: PROTOCOL,
+            },
+        )
+        .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Reply>(&line).unwrap(),
+            Reply::Welcome { .. }
+        ));
     }
 
     #[test]
