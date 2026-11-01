@@ -48,6 +48,7 @@ dist() {
     local id
     id=$(identity)
     [[ -n $id ]] || die "no Developer ID Application identity in the keychain"
+    command -v cargo >/dev/null || die "no cargo on PATH (Homebrew rustup)"
     rm -rf "$DIST" && mkdir -p "$DIST"
     for target in aarch64-apple-darwin x86_64-apple-darwin; do
         cargo build --release --locked --target "$target"
@@ -84,9 +85,11 @@ publish() {
     gh release create "$TAG" "$ZIP" "$ZIP.sha256" --title "mx-keypad $TAG" --generate-notes
 }
 
+# One command per line: inside an && list, set -e would not stop a failed
+# build, and a stale binary in target/ would be shipped.
 case $STEP in
     dist) dist ;;
-    notarize) dist && notarize ;;
-    publish) dist && notarize && publish ;;
+    notarize) dist; notarize ;;
+    publish) dist; notarize; publish ;;
     *) die "unknown step $STEP (dist, notarize, publish)" ;;
 esac
