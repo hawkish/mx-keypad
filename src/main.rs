@@ -232,8 +232,10 @@ struct Runner {
 
 impl Runner {
     /// Draw the current page. Tiles come from the cache, and `Keypad::draw`
-    /// skips keys that already show theirs.
+    /// skips keys that already show theirs. A key that fails does not stop
+    /// the others; the first failure is returned once all were tried.
     fn show(&mut self, keypad: &mut Keypad) -> Result<()> {
+        let mut first_error = None;
         for (i, (face, _)) in self.setup.pages[self.page].keys.iter().enumerate() {
             // `Face` holds an f32, so it is keyed by its full Debug form.
             let key = format!("{face:?}");
@@ -245,9 +247,11 @@ impl Runner {
                     tile
                 }
             };
-            keypad.draw(u8::try_from(i + 1)?, &tile)?;
+            if let Err(error) = keypad.draw(u8::try_from(i + 1)?, &tile) {
+                first_error.get_or_insert(error.context(format!("key {}", i + 1)));
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Take the page buttons over only when the setup uses them.

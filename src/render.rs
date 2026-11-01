@@ -354,22 +354,35 @@ fn draw_label(pixmap: &mut tiny_skia::Pixmap, label: &str, colour: Rgb) -> Resul
     Ok(())
 }
 
+/// JPEG qualities tried in turn until a tile fits one image packet.
+const QUALITIES: [u8; 6] = [90, 80, 70, 60, 50, 40];
+
+/// Encode the tile as a baseline JPEG, lowering the quality until it fits
+/// in a single image packet: only single-packet writes are verified on the
+/// keypad, and a split write was seen to go unacknowledged. A tile that
+/// still does not fit at the lowest quality is encoded at that quality.
 fn encode(pixmap: &tiny_skia::Pixmap, size: u16) -> Result<KeyImageJpeg, RenderError> {
     let rgb: Vec<u8> = pixmap
         .data()
         .chunks_exact(4)
         .flat_map(|p| [p[0], p[1], p[2]])
         .collect();
-    let mut jpeg = Cursor::new(Vec::new());
-    JpegEncoder::new_with_quality(&mut jpeg, 90)
-        .write_image(
-            &rgb,
-            u32::from(size),
-            u32::from(size),
-            ExtendedColorType::Rgb8,
-        )
-        .map_err(|error| RenderError::Encode(error.to_string()))?;
-    let bytes = jpeg.into_inner();
+    let mut bytes = Vec::new();
+    for quality in QUALITIES {
+        let mut jpeg = Cursor::new(Vec::new());
+        JpegEncoder::new_with_quality(&mut jpeg, quality)
+            .write_image(
+                &rgb,
+                u32::from(size),
+                u32::from(size),
+                ExtendedColorType::Rgb8,
+            )
+            .map_err(|error| RenderError::Encode(error.to_string()))?;
+        bytes = jpeg.into_inner();
+        if bytes.len() <= crate::image::SINGLE_PACKET_JPEG {
+            break;
+        }
+    }
     let len = bytes.len();
     KeyImageJpeg::new(bytes)
         .ok_or_else(|| RenderError::Encode(format!("{len} bytes do not fit the image write")))
@@ -378,6 +391,18 @@ fn encode(pixmap: &tiny_skia::Pixmap, size: u16) -> Result<KeyImageJpeg, RenderE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_detailed_labelled_tile_still_fits_one_packet() {
+        // The test page's mouse-back key came to 4255 bytes at quality 90.
+        let face = Face {
+            icon: Some(IconSource::Builtin("circle-arrow-left".into())),
+            label: Some("Mouse back".into()),
+            ..Face::default()
+        };
+        let tile = render_tile(&face, 118).unwrap();
+        assert!(tile.as_bytes().len() <= crate::image::SINGLE_PACKET_JPEG);
+    }
 
     fn bell() -> Face {
         Face {

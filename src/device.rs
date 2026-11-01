@@ -12,7 +12,7 @@ use hidapi::{HidApi, HidDevice};
 
 use crate::geometry::{PanelPoint, DISPLAY, PRODUCT_ID, VENDOR_ID};
 use crate::hidpp::{self, Link, BRIGHTNESS_CONTROL, REPROG_CONTROLS_V4};
-use crate::image::{ack_part, image_ack, image_packets, KeyImageJpeg, ACK_TIMEOUT};
+use crate::image::{image_ack, image_packets, KeyImageJpeg, ACK_TIMEOUT};
 use crate::input::{Decoder, Event, LEFT_PAGING, RIGHT_PAGING};
 use crate::render;
 
@@ -276,7 +276,6 @@ fn write_image(
 ) -> Result<(), WriteFailure> {
     let other = |e: String| WriteFailure::Other(anyhow!(e));
     let packets = image_packets(origin, DISPLAY.key_size, image);
-    let part = ack_part(&packets);
     for packet in &packets {
         link.write(packet)
             .map_err(|e| other(format!("HID write: {e}")))?;
@@ -290,7 +289,7 @@ fn write_image(
         if n == 0 {
             continue;
         }
-        match image_ack(&buf[..n], part) {
+        match image_ack(&buf[..n]) {
             Some(Ok(())) => return Ok(()),
             Some(Err(status)) => return Err(WriteFailure::Refused(status)),
             None => stray.push(buf[..n].to_vec()),

@@ -29,6 +29,8 @@ const IMAGE_HEADER: [u8; 4] = output_header(VendorFunction::Image);
 /// Every image packet is a full-width report.
 pub(crate) const PACKET_LEN: usize = 4095;
 const FIRST_HEADER_LEN: usize = 20;
+/// The largest JPEG that fits in the first packet alone.
+pub const SINGLE_PACKET_JPEG: usize = PACKET_LEN - FIRST_HEADER_LEN;
 const NEXT_HEADER_LEN: usize = 5;
 /// Marks every part byte; the acknowledgement echoes the part without it.
 const PART_MARKER: u8 = 0x20;
@@ -68,19 +70,16 @@ impl KeyImageJpeg {
     }
 }
 
-/// The part byte the acknowledgement of `packets` echoes: the last packet's,
-/// without its marker.
-pub(crate) fn ack_part(packets: &[Vec<u8>]) -> u8 {
-    packets[packets.len() - 1][4] & !PART_MARKER
-}
-
-/// The device's answer in `report` to the image write whose acknowledgement
-/// echoes `ack_part`: `Ok` when it took the image, `Err` with the status it
-/// sent otherwise, and `None` when `report` answers anything else — another
-/// function, another write's part, or a header cut short.
-pub(crate) fn image_ack(report: &[u8], ack_part: u8) -> Option<Result<(), [u8; 2]>> {
+/// The device's answer in `report` to an image write: `Ok` when it took the
+/// image, `Err` with the status it sent otherwise, and `None` when `report`
+/// is not an image acknowledgement.
+///
+/// The part byte is only verified for single-packet writes; a split write
+/// went unanswered under that check on hardware, so any image ack counts.
+/// Writes go out one at a time, so the ack can only be this write's.
+pub(crate) fn image_ack(report: &[u8]) -> Option<Result<(), [u8; 2]>> {
     match input_payload(report, VendorFunction::Image)? {
-        [part, high, low, ..] if *part == ack_part => {
+        [_part, high, low, ..] => {
             let status = [*high, *low];
             Some(if status == ACK_ACCEPTED {
                 Ok(())
@@ -199,7 +198,6 @@ mod tests {
         // Middle: index 2, neither marker. Last: index 3, last marker.
         assert_eq!(packets[1][..5], [0x14, 0xff, 0x02, 0x2b, 0x22]);
         assert_eq!(packets[2][..5], [0x14, 0xff, 0x02, 0x2b, 0x63]);
-        assert_eq!(ack_part(&packets), 0x43);
         let carried: Vec<u8> = packets[0][FIRST_HEADER_LEN..]
             .iter()
             .chain(&packets[1][NEXT_HEADER_LEN..])
@@ -218,7 +216,6 @@ mod tests {
         );
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0][4], 0xe1);
-        assert_eq!(ack_part(&packets), 0xc1);
     }
 
     #[test]
@@ -237,30 +234,24 @@ mod tests {
     }
 
     #[test]
-    fn only_a_vendor_image_report_for_this_write_counts_as_an_ack() {
-        // A single-packet write's part is 0xe1; the ack echoes it as 0xc1.
-        let part = 0xe1 & !PART_MARKER;
-        assert_eq!(image_ack(&hardware_ack(), part), Some(Ok(())));
-        // The last packet of a three-packet write is 0x63, echoed as 0x43.
-        assert_eq!(image_ack(&hardware_ack(), 0x63 & !PART_MARKER), None);
+    fn only_a_vendor_image_report_counts_as_an_ack() {
+        assert_eq!(image_ack(&hardware_ack()), Some(Ok(())));
+        // Any part counts: a split write's ack was not seen to echo it.
+        let mut other_part = hardware_ack();
+        other_part[4] = 0x43;
+        assert_eq!(image_ack(&other_part), Some(Ok(())));
         // A grid-key press shares the channel, not the function.
-        assert_eq!(
-            image_ack(&[0x13, 0xff, 0x02, 0x00, 0xc1, 0x00, 0x01], part),
-            None
-        );
+        assert_eq!(image_ack(&[0x13, 0xff, 0x02, 0x00, 0xc1, 0x00, 0x01]), None);
         // A HID++ long reply with the same leading bytes is another report.
-        assert_eq!(
-            image_ack(&[0x11, 0xff, 0x02, 0x2b, 0xc1, 0x00, 0x01], part),
-            None
-        );
-        assert_eq!(image_ack(&[0x13, 0xff, 0x02, 0x2b, 0xc1], part), None);
-        assert_eq!(image_ack(&[0x13, 0xff], part), None);
+        assert_eq!(image_ack(&[0x11, 0xff, 0x02, 0x2b, 0xc1, 0x00, 0x01]), None);
+        assert_eq!(image_ack(&[0x13, 0xff, 0x02, 0x2b, 0xc1]), None);
+        assert_eq!(image_ack(&[0x13, 0xff]), None);
     }
 
     #[test]
     fn an_ack_with_any_other_status_is_a_refusal() {
         let mut ack = hardware_ack();
         ack[5..7].copy_from_slice(&[0x00, 0x00]);
-        assert_eq!(image_ack(&ack, 0xc1), Some(Err([0x00, 0x00])));
+        assert_eq!(image_ack(&ack), Some(Err([0x00, 0x00])));
     }
 }
