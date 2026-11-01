@@ -261,7 +261,11 @@ pub fn trusted(prompt: bool) -> bool {
 
 /// Press and release `chord`.
 pub fn send_chord(chord: Chord) -> Result<()> {
-    let resolved = chord.resolve();
+    tap(chord.resolve())
+}
+
+/// Press and release a shortcut already resolved, on any thread.
+pub fn tap(resolved: Resolved) -> Result<()> {
     platform::post_modifiers(resolved.modifiers, true)?;
     let tapped = platform::post_key(resolved.code, resolved.modifiers, true)
         .and_then(|()| platform::post_key(resolved.code, resolved.modifiers, false));
@@ -283,6 +287,40 @@ pub fn press_key(resolved: Resolved, down: bool) -> Result<()> {
 /// Type `text`.
 pub fn type_text(text: &str) -> Result<()> {
     platform::type_text(text)
+}
+
+/// A mouse button to click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    /// Primary click.
+    Left,
+    /// Secondary click.
+    Right,
+    /// Wheel click.
+    Middle,
+    /// The side button that goes back (button 4).
+    Back,
+    /// The side button that goes forward (button 5).
+    Forward,
+}
+
+impl MouseButton {
+    /// Parse `left`, `right`, `middle`, `back` or `forward`.
+    pub fn parse(name: &str) -> Result<MouseButton> {
+        Ok(match name.to_ascii_lowercase().as_str() {
+            "left" => MouseButton::Left,
+            "right" => MouseButton::Right,
+            "middle" => MouseButton::Middle,
+            "back" => MouseButton::Back,
+            "forward" => MouseButton::Forward,
+            _ => bail!("{name:?}: mouse buttons are left, right, middle, back and forward"),
+        })
+    }
+}
+
+/// Click `button` where the pointer is.
+pub fn click(button: MouseButton) -> Result<()> {
+    platform::click(button)
 }
 
 /// A media key, as the keyboard's top row sends it.
@@ -570,6 +608,57 @@ mod platform {
         }
     }
 
+    pub(super) fn click(button: super::MouseButton) -> Result<()> {
+        use super::MouseButton;
+        use core_graphics::event::{CGEventType, CGMouseButton, EventField};
+
+        require_trust()?;
+        let at = CGEvent::new(source()?)
+            .map_err(|()| anyhow!("cannot read the pointer position"))?
+            .location();
+        // Back and forward are "other" buttons 3 and 4, as a mouse's side
+        // buttons report them; middle is other button 2.
+        let (down, up, kind, number) = match button {
+            MouseButton::Left => (
+                CGEventType::LeftMouseDown,
+                CGEventType::LeftMouseUp,
+                CGMouseButton::Left,
+                0,
+            ),
+            MouseButton::Right => (
+                CGEventType::RightMouseDown,
+                CGEventType::RightMouseUp,
+                CGMouseButton::Right,
+                1,
+            ),
+            MouseButton::Middle => (
+                CGEventType::OtherMouseDown,
+                CGEventType::OtherMouseUp,
+                CGMouseButton::Center,
+                2,
+            ),
+            MouseButton::Back => (
+                CGEventType::OtherMouseDown,
+                CGEventType::OtherMouseUp,
+                CGMouseButton::Center,
+                3,
+            ),
+            MouseButton::Forward => (
+                CGEventType::OtherMouseDown,
+                CGEventType::OtherMouseUp,
+                CGMouseButton::Center,
+                4,
+            ),
+        };
+        for kind_of in [down, up] {
+            let event = CGEvent::new_mouse_event(source()?, kind_of, at, kind)
+                .map_err(|()| anyhow!("cannot create a mouse event"))?;
+            event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, number);
+            event.post(CGEventTapLocation::HID);
+        }
+        Ok(())
+    }
+
     /// `NSPoint`, for `otherEventWithType:…`'s location argument.
     #[repr(C)]
     struct Point {
@@ -675,6 +764,10 @@ mod platform {
         bail!("sending keystrokes is only supported on macOS")
     }
 
+    pub(super) fn click(_button: super::MouseButton) -> Result<()> {
+        bail!("clicking is only supported on macOS")
+    }
+
     pub(super) fn type_text(_text: &str) -> Result<()> {
         bail!("sending keystrokes is only supported on macOS")
     }
@@ -770,6 +863,12 @@ mod tests {
                 ..Modifiers::default()
             }
         );
+    }
+
+    #[test]
+    fn mouse_buttons_parse_their_names() {
+        assert_eq!(MouseButton::parse("Back").unwrap(), MouseButton::Back);
+        assert!(MouseButton::parse("thumb").is_err());
     }
 
     #[test]

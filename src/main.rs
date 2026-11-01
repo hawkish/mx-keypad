@@ -223,6 +223,8 @@ struct Runner {
     children: Vec<Child>,
     /// Rendered tiles by face, so a page is rendered once per config load.
     tiles: HashMap<String, KeyImageJpeg>,
+    /// What each pressed button is holding until it is released.
+    held: HashMap<Button, Held>,
 }
 
 impl Runner {
@@ -283,21 +285,20 @@ impl Runner {
         }
     }
 
-    fn act(&mut self, keypad: &mut Keypad, action: &Action) -> Result<()> {
+    /// The action `button` has on the current page.
+    fn action(&self, button: Button) -> Action {
+        match button {
+            Button::Key(n) => self.setup.pages[self.page].keys[usize::from(n) - 1]
+                .1
+                .clone(),
+            Button::PageLeft => self.setup.left.clone(),
+            Button::PageRight => self.setup.right.clone(),
+        }
+    }
+
+    /// `button` went down with `action` bound to it.
+    fn press(&mut self, keypad: &mut Keypad, button: Button, action: &Action) -> Result<()> {
         match action {
-            Action::None => {}
-            Action::Run(command) => {
-                let child = Command::new("sh")
-                    .arg("-c")
-                    .arg(command)
-                    .stdin(Stdio::null())
-                    .spawn()
-                    .with_context(|| format!("cannot run {command:?}"))?;
-                self.children.push(child);
-            }
-            Action::Keys(chord) => keys::send_chord(Chord::parse(chord)?)?,
-            Action::Text(text) => keys::type_text(text)?,
-            Action::Media(name) => keys::send_media(keys::MediaKey::parse(name)?)?,
             Action::Page(_) => {
                 if let Some(to) = self.setup.target(self.page, action) {
                     if to != self.page {
@@ -306,8 +307,156 @@ impl Runner {
                     }
                 }
             }
+            Action::Hold(chord) => {
+                let resolved = Chord::parse(chord)?.resolve();
+                keys::press_modifiers(resolved.modifiers, true)?;
+                keys::press_key(resolved, true)?;
+                self.held.insert(button, Held::Hold(resolved));
+            }
+            Action::Switch(chord) => {
+                let resolved = Chord::parse(chord)?.resolve();
+                keys::press_modifiers(resolved.modifiers, true)?;
+                keys::press_key(resolved, true)?;
+                keys::press_key(resolved, false)?;
+                self.held.insert(button, Held::Switch(resolved.modifiers));
+            }
+            Action::Sequence(steps) => {
+                // Resolve shortcuts here, on the main thread, where the
+                // keyboard layout API must be called; delays then run off it.
+                let steps = steps.iter().map(prepare).collect::<Result<Vec<_>>>()?;
+                std::thread::spawn(move || {
+                    for step in &steps {
+                        if let Err(error) = perform(step, true) {
+                            eprintln!("sequence stopped: {error:#}");
+                            break;
+                        }
+                    }
+                });
+            }
+            action => {
+                if let Some(child) = perform(&prepare(action)?, false)? {
+                    self.children.push(child);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// `button` came up: let go of whatever its press is holding.
+    fn release(&mut self, button: Button) -> Result<()> {
+        match self.held.remove(&button) {
+            Some(held) => held.release(),
+            None => Ok(()),
+        }
+    }
+
+    /// Let go of everything held, when the session ends.
+    fn release_all(&mut self) {
+        for (_, held) in self.held.drain() {
+            if let Err(error) = held.release() {
+                eprintln!("{error:#}");
+            }
+        }
+    }
+}
+
+/// Input a pressed key is holding down until it is released.
+enum Held {
+    /// A `hold` shortcut: its key and modifiers.
+    Hold(keys::Resolved),
+    /// A `switch` shortcut: its modifiers.
+    Switch(keys::Modifiers),
+}
+
+impl Held {
+    fn release(self) -> Result<()> {
+        match self {
+            Held::Hold(resolved) => {
+                keys::press_key(resolved, false)?;
+                keys::press_modifiers(resolved.modifiers, false)
+            }
+            Held::Switch(modifiers) => keys::press_modifiers(modifiers, false),
+        }
+    }
+}
+
+/// An action ready to perform on any thread: shortcuts already resolved.
+enum Step {
+    Nothing,
+    Run(String),
+    Open(Vec<String>),
+    Tap(keys::Resolved),
+    Text(String),
+    Media(keys::MediaKey),
+    Mouse(keys::MouseButton),
+    Delay(Duration),
+}
+
+/// Make `action` ready to perform. Page, hold, switch and sequence are
+/// handled by [`Runner::press`] and never get here.
+fn prepare(action: &Action) -> Result<Step> {
+    Ok(match action {
+        Action::None | Action::Page(_) | Action::Hold(_) | Action::Switch(_) => Step::Nothing,
+        Action::Sequence(_) => anyhow::bail!("a sequence cannot contain a sequence"),
+        Action::Run(command) => Step::Run(command.clone()),
+        Action::Open(target) => Step::Open(open_args(target)),
+        Action::Keys(chord) => Step::Tap(Chord::parse(chord)?.resolve()),
+        Action::Text(text) => Step::Text(text.clone()),
+        Action::Media(name) => Step::Media(keys::MediaKey::parse(name)?),
+        Action::Mouse(name) => Step::Mouse(keys::MouseButton::parse(name)?),
+        Action::System(name) => match name.as_str() {
+            "sleep" => Step::Run("pmset sleepnow".into()),
+            "display-sleep" => Step::Run("pmset displaysleepnow".into()),
+            _ => Step::Tap(Chord::parse("ctrl+cmd+q")?.resolve()),
+        },
+        Action::Delay(ms) => Step::Delay(Duration::from_millis(*ms)),
+    })
+}
+
+/// `open`'s arguments for `target`: an app by name, or a URL or path.
+fn open_args(target: &str) -> Vec<String> {
+    let target = target.trim();
+    let expanded = match (target.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => Path::new(&home).join(rest).display().to_string(),
+        _ => target.to_string(),
+    };
+    let is_location = target.contains("://")
+        || target.starts_with("mailto:")
+        || target.starts_with('/')
+        || target.starts_with('~')
+        || target.starts_with('.');
+    if is_location {
+        vec![expanded]
+    } else {
+        vec!["-a".into(), expanded]
+    }
+}
+
+/// Perform `step`. A command started by `run` or `open` is returned to be
+/// reaped later, or waited for when `wait` (inside a sequence, so steps
+/// stay in order).
+fn perform(step: &Step, wait: bool) -> Result<Option<Child>> {
+    let spawn = |command: &mut Command| -> Result<Option<Child>> {
+        command.stdin(Stdio::null());
+        if wait {
+            command.status().context("cannot run a command")?;
+            Ok(None)
+        } else {
+            Ok(Some(command.spawn().context("cannot run a command")?))
+        }
+    };
+    match step {
+        Step::Nothing => Ok(None),
+        Step::Run(command) => spawn(Command::new("sh").arg("-c").arg(command)),
+        Step::Open(args) => spawn(Command::new("/usr/bin/open").args(args)),
+        Step::Tap(resolved) => keys::tap(*resolved).map(|()| None),
+        Step::Text(text) => keys::type_text(text).map(|()| None),
+        Step::Media(key) => keys::send_media(*key).map(|()| None),
+        Step::Mouse(button) => keys::click(*button).map(|()| None),
+        Step::Delay(delay) => {
+            std::thread::sleep(*delay);
+            Ok(None)
+        }
     }
 }
 
@@ -333,6 +482,7 @@ fn run(path: &Path) -> Result<()> {
         page: 0,
         children: Vec::new(),
         tiles: HashMap::new(),
+        held: HashMap::new(),
     };
     let mut api = HidApi::new()?;
     let mut waiting = false;
@@ -356,6 +506,7 @@ fn run(path: &Path) -> Result<()> {
         }
         let started = Instant::now();
         let served = session(&mut runner, &mut keypad, &stop);
+        runner.release_all();
         // Blank the keys on the way out, whatever ended the session: images
         // left behind would look live while nothing answers the presses.
         let cleared = keypad.clear();
@@ -395,15 +546,14 @@ fn session(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Resul
 fn serve(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
         for event in poll(keypad, stop)? {
-            let Event::Down(button) = event else { continue };
-            let action = match button {
-                Button::Key(n) => runner.setup.pages[runner.page].keys[usize::from(n) - 1]
-                    .1
-                    .clone(),
-                Button::PageLeft => runner.setup.left.clone(),
-                Button::PageRight => runner.setup.right.clone(),
+            let result = match event {
+                Event::Down(button) => {
+                    let action = runner.action(button);
+                    runner.press(keypad, button, &action)
+                }
+                Event::Up(button) => runner.release(button),
             };
-            if let Err(error) = runner.act(keypad, &action) {
+            if let Err(error) = result {
                 eprintln!("{error:#}");
             }
         }
@@ -434,4 +584,19 @@ fn sleep_unless_stopped(delay: Duration, stop: &AtomicBool) -> bool {
         std::thread::sleep(TICK);
     }
     stop.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_args;
+
+    #[test]
+    fn open_takes_names_as_apps_and_the_rest_as_locations() {
+        assert_eq!(open_args("Safari"), ["-a", "Safari"]);
+        assert_eq!(open_args("System Settings"), ["-a", "System Settings"]);
+        assert_eq!(open_args("https://example.com"), ["https://example.com"]);
+        assert_eq!(open_args("/Applications"), ["/Applications"]);
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(open_args("~/Downloads"), [format!("{home}/Downloads")]);
+    }
 }

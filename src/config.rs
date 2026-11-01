@@ -130,13 +130,52 @@ pub enum Action {
     /// Press a media key: `mute`, `volume-up`, `volume-down`, `play-pause`,
     /// `next` or `previous` (macOS).
     Media(String),
+    /// Open an app by name, or a URL, folder or file (macOS `open`).
+    Open(String),
+    /// Hold a shortcut for as long as the key is held (macOS).
+    Hold(String),
+    /// Hold a shortcut's modifiers while the key is held, tapping its key
+    /// once on press: `cmd+tab` keeps the app switcher open (macOS).
+    Switch(String),
+    /// Click a mouse button where the pointer is: `left`, `right`,
+    /// `middle`, `back` or `forward` (macOS).
+    Mouse(String),
+    /// `sleep`, `display-sleep` or `lock` (macOS).
+    System(String),
+    /// Several actions in order. Steps can be any action except `page`,
+    /// `hold`, `switch` and another `sequence`, plus `delay`.
+    Sequence(Vec<Action>),
+    /// Wait this many milliseconds, up to 10 000; only inside a `sequence`.
+    Delay(u64),
 }
 
+/// The `system` actions.
+pub const SYSTEM_ACTIONS: [&str; 3] = ["sleep", "display-sleep", "lock"];
+
+/// The longest `delay` a sequence may hold, in milliseconds.
+pub const MAX_DELAY_MS: u64 = 10_000;
+
 impl Action {
-    /// Whether the action sends keystrokes, which needs Accessibility.
+    /// Whether the action posts input events, which needs Accessibility.
     #[must_use]
     pub fn sends_keys(&self) -> bool {
-        matches!(self, Action::Keys(_) | Action::Text(_) | Action::Media(_))
+        match self {
+            Action::Keys(_)
+            | Action::Text(_)
+            | Action::Media(_)
+            | Action::Hold(_)
+            | Action::Switch(_)
+            | Action::Mouse(_) => true,
+            Action::System(name) => name == "lock",
+            Action::Sequence(steps) => steps.iter().any(Action::sends_keys),
+            _ => false,
+        }
+    }
+
+    /// Whether the action acts on release as well as press.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        matches!(self, Action::Hold(_) | Action::Switch(_))
     }
 }
 
@@ -314,18 +353,49 @@ impl Setup {
 }
 
 fn check_action(action: &Action, names: &[&str], at: &str) -> Result<()> {
+    check_step(action, names, at, false)
+}
+
+/// Validate `action`; `in_sequence` when it is a step of a `sequence`.
+fn check_step(action: &Action, names: &[&str], at: &str, in_sequence: bool) -> Result<()> {
+    use crate::keys::{Chord, MediaKey, MouseButton};
+    let chord = |chord: &str, what: &str| {
+        Chord::parse(chord)
+            .map(drop)
+            .with_context(|| format!("{at}.{what}"))
+    };
     match action {
+        Action::Page(_) | Action::Hold(_) | Action::Switch(_) | Action::Sequence(_)
+            if in_sequence =>
+        {
+            bail!("{at}: a sequence step cannot be page, hold, switch or another sequence")
+        }
+        Action::Delay(_) if !in_sequence => bail!("{at}: delay only works inside a sequence"),
+        Action::Delay(ms) if *ms > MAX_DELAY_MS => {
+            bail!("{at}.delay: {ms} ms is longer than {MAX_DELAY_MS} ms")
+        }
         Action::Page(to) if to != "next" && to != "prev" && !names.contains(&to.as_str()) => {
             bail!("{at}: no page is named {to:?}")
         }
         Action::Run(command) if command.trim().is_empty() => bail!("{at}: empty command"),
+        Action::Open(target) if target.trim().is_empty() => bail!("{at}: empty open target"),
         Action::Text(text) if text.is_empty() => bail!("{at}: empty text"),
-        Action::Media(name) => crate::keys::MediaKey::parse(name)
+        Action::Media(name) => MediaKey::parse(name)
             .map(drop)
             .with_context(|| format!("{at}.media")),
-        Action::Keys(chord) => crate::keys::Chord::parse(chord)
+        Action::Mouse(name) => MouseButton::parse(name)
             .map(drop)
-            .with_context(|| format!("{at}.keys")),
+            .with_context(|| format!("{at}.mouse")),
+        Action::System(name) if !SYSTEM_ACTIONS.contains(&name.as_str()) => {
+            bail!("{at}.system: {name:?} is not one of {SYSTEM_ACTIONS:?}")
+        }
+        Action::Keys(c) => chord(c, "keys"),
+        Action::Hold(c) => chord(c, "hold"),
+        Action::Switch(c) => chord(c, "switch"),
+        Action::Sequence(steps) if steps.is_empty() => bail!("{at}: empty sequence"),
+        Action::Sequence(steps) => steps.iter().enumerate().try_for_each(|(i, step)| {
+            check_step(step, names, &format!("{at}.sequence[{i}]"), true)
+        }),
         _ => Ok(()),
     }
 }
@@ -417,6 +487,38 @@ mod tests {
         assert_eq!(keys[1].0.background, Rgb(0x11, 0x22, 0x33));
         assert_eq!(keys[1].1, Action::Run("true".into()));
         assert_eq!(setup.left, Action::Page("prev".into()));
+    }
+
+    #[test]
+    fn the_new_actions_validate() {
+        let ok = |action: &str| {
+            setup(&format!(
+                r#"{{ "pages": [{{ "name": "a", "keys": {{ "1": {{ "action": {action} }} }} }}] }}"#
+            ))
+        };
+        for action in [
+            r#"{ "open": "Safari" }"#,
+            r#"{ "hold": "cmd+shift+m" }"#,
+            r#"{ "switch": "cmd+tab" }"#,
+            r#"{ "mouse": "back" }"#,
+            r#"{ "system": "display-sleep" }"#,
+            r#"{ "sequence": [{ "keys": "cmd+a" }, { "delay": 100 }, { "text": "hi" }] }"#,
+        ] {
+            assert!(ok(action).is_ok(), "{action}");
+        }
+        let err = |action: &str| format!("{:#}", ok(action).unwrap_err());
+        assert!(err(r#"{ "delay": 5 }"#).contains("only works inside a sequence"));
+        assert!(err(r#"{ "sequence": [{ "delay": 20000 }] }"#).contains("longer than"));
+        assert!(err(r#"{ "sequence": [{ "page": "a" }] }"#).contains("cannot be page"));
+        assert!(
+            err(r#"{ "sequence": [{ "sequence": [{ "text": "x" }] }] }"#)
+                .contains("another sequence")
+        );
+        assert!(err(r#"{ "sequence": [] }"#).contains("empty sequence"));
+        assert!(err(r#"{ "system": "reboot" }"#).contains("not one of"));
+        assert!(err(r#"{ "mouse": "thumb" }"#).contains(".mouse"));
+        assert!(err(r#"{ "hold": "cmd+" }"#).contains(".hold"));
+        assert!(err(r#"{ "sequence": [{ "keys": "cmd+zz" }] }"#).contains("sequence[0]"));
     }
 
     #[test]
