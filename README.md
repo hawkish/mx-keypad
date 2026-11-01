@@ -1,49 +1,82 @@
 # mx-keypad
 
-Drive the Logitech MX Creative Keypad from a JSON file: what each of the nine LCD keys shows,
-what pressing it does, how many pages there are, and how bright the panel is. It needs no Logi
-Options+ and no daemon beyond the `mx-keypad run` process itself.
+Control the Logitech MX Creative Keypad over USB with a JSON configuration. Set images and actions
+for its nine 118 × 118 LCD keys, assign the two page buttons, and adjust panel brightness.
 
-`mx-keypad` is also a Rust library (`mx_keypad::Keypad`) that other tools can drive the keypad
-through. It's built on blocking `hidapi` with no async runtime.
+The Rust library exposes the same device operations without an async runtime. A planned use is to
+show AI-agent status from tmux-legion; that integration isn't built yet.
 
-The protocol code is ported from [OpenLogi](https://github.com/aprilnea/openlogi). See
-[PROTOCOL.md](PROTOCOL.md) for the wire format and [NOTICE](NOTICE) for credits.
+## Install and check a configuration
 
-## Install
+From a checkout, install with Nix or Cargo:
 
 ```sh
-nix profile install .   # or
+nix profile install .
+# Or, with Rust and Cargo installed:
 cargo install --path .
 ```
 
-Connect the keypad over USB. Quit Logi Options+ and OpenLogi first, since either one holds the
-device. On macOS your terminal may need **Input Monitoring** permission. On Linux, `/dev/hidraw*`
-needs a udev rule:
+Validate the included example and render its tiles without connecting a keypad:
 
+```sh
+mx-keypad check --config examples/demo.json
 ```
+
+```text
+examples/demo.json: 2 page(s), every tile renders
+```
+
+The example's actions use macOS commands. Change them before running the configuration on Linux.
+
+## Connect the keypad
+
+Connect the keypad over USB-C and quit Logi Options+ and OpenLogi before opening the device. On
+macOS, your terminal may need **Input Monitoring** permission. On Linux, grant access to the
+device's hidraw node with a udev rule, for example in `/etc/udev/rules.d/99-mx-keypad.rules`:
+
+```text
 KERNEL=="hidraw*", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c354", MODE="0660", TAG+="uaccess"
 ```
 
-## Usage
+Reload your udev rules and reconnect the keypad. The rule uses `uaccess` to grant an active local
+session access; your system's device access policy may require a different rule.
+
+## Use the CLI
+
+Run a configuration on the keypad. Press Ctrl-C to stop:
 
 ```sh
-mx-keypad check --config examples/demo.json --out /tmp/tiles   # validate and render, no device needed
-mx-keypad run --config examples/demo.json                       # show the setup and act on presses
-mx-keypad draw 1 bell --bg '#cc0000' --label Alert              # draw one key
-mx-keypad brightness 50
-mx-keypad events                                                # print presses
-mx-keypad icons                                                 # built-in icon names
+mx-keypad run --config examples/demo.json
 ```
 
-`run` and `check` read `~/.config/mx-keypad/config.json` when you don't pass `--config`. `run`
-reloads the file whenever it changes. If the new version doesn't validate, `run` keeps the setup
-it already has and prints the error.
+`run` shows the first page, executes actions on press, and checks for configuration changes. If a
+changed file fails validation, it reports the error and keeps the previous configuration. Both
+`run` and `events` take over the page buttons while active and attempt to return them to the
+firmware on exit, including Ctrl-C and SIGTERM.
 
-While `run` or `events` is going, the page buttons are taken over. They're handed back to the
-firmware on exit, including on Ctrl-C and SIGTERM.
+Use the other commands to check a configuration, draw a tile, or inspect input:
 
-## Config
+```sh
+mx-keypad check --config examples/demo.json --out /tmp/tiles
+mx-keypad draw 1 bell --bg '#cc0000' --fg '#ffffff' --label Alert
+mx-keypad brightness 50
+mx-keypad events
+mx-keypad icons
+```
+
+`check` renders every key on every page without a device; `--out` saves them as
+`<page>-<key>.jpg`. `draw` accepts a key number and a built-in icon name or image path; its
+background and foreground default to black and white. `brightness` accepts 1–100. `events` prints
+key and page-button press and release events, and `icons` lists the built-in names. `draw`,
+`brightness`, and `events` need the keypad; `check` and `icons` don't.
+
+When `--config` is omitted, `run` and `check` use `$XDG_CONFIG_HOME/mx-keypad/config.json` if
+`XDG_CONFIG_HOME` is absolute. Otherwise, they use `~/.config/mx-keypad/config.json`.
+
+## Configure pages and keys
+
+This example uses one page and one key. Save it as a JSON file and pass its path to `check` or
+`run`:
 
 ```json
 {
@@ -53,9 +86,7 @@ firmware on exit, including on Ctrl-C and SIGTERM.
     {
       "name": "main",
       "keys": {
-        "1": { "icon": "square-terminal", "label": "Shell", "action": { "run": "open -a Terminal" } },
-        "2": { "icon": "./icons/claude.png", "background": "#cc785c", "action": { "run": "tmux select-window -t 2" } },
-        "9": { "icon": "chevron-right", "action": { "page": "next" } }
+        "1": { "icon": "bell", "label": "Alert", "action": { "run": "printf 'pressed\\n' >> /tmp/mx-keypad.log" } }
       }
     }
   ],
@@ -63,43 +94,73 @@ firmware on exit, including on Ctrl-C and SIGTERM.
 }
 ```
 
-| Field | Meaning |
-|---|---|
-| `brightness` | Panel brightness, 1–100. Leave it out to keep the current level. |
-| `defaults` | The `background`, `foreground` and `glyph_scale` every key inherits. |
-| `pages[].name` | A unique name that `page` actions can jump to. The first page is shown at start. |
-| `pages[].keys` | Keys `"1"`–`"9"`, row-major from the top left. A key you leave out is blank and does nothing. |
-| `icon` | A built-in name (see `mx-keypad icons`), or a path to an `.svg`, `.png` or `.jpg` file relative to the config file. `~/` works too. SVGs that use `currentColor` take the key's `foreground`. |
-| `label` | Text drawn under the icon. |
-| `background`, `foreground` | `#rrggbb` |
-| `glyph_scale` | How much of the key the icon spans, 0.05–1. |
-| `action` | `{ "run": "<shell command>" }`, `{ "page": "next" \| "prev" \| "<name>" }`, or `{ "none": true }`. |
-| `page_buttons` | The `left` and `right` page buttons' actions. They default to `prev` and `next`. |
+| Field | Description |
+| --- | --- |
+| `brightness` | Optional integer from 1 to 100. If omitted, leave the current brightness unchanged. |
+| `defaults.background` | Default key background as six hexadecimal digits, with or without `#`. Default: `#000000`. |
+| `defaults.foreground` | Default icon and label color in the same format. Default: `#ffffff`. |
+| `defaults.glyph_scale` | Default icon size as a fraction of the key side. Default: `0.55`; use `0.05`–`1.0`. |
+| `pages` | Required array of at least one page. The first page is shown at startup. |
+| `pages[].name` | Required, unique page name. Use it as a page action's target. |
+| `pages[].keys` | Optional object mapping key numbers `"1"`–`"9"` to key settings, in row-major order from the top left. Omitted keys have the default background and no icon, label, or action. |
+| `pages[].keys.<key>.icon` | Optional built-in name from `mx-keypad icons`, or a path to an `.svg`, `.png`, `.jpg`, or `.jpeg` file. Relative paths resolve from the config file's directory; `~/` resolves from `HOME`. SVG `currentColor` uses the foreground color. |
+| `pages[].keys.<key>.label` | Optional text drawn near the bottom of the key. Labels use system fonts. |
+| `pages[].keys.<key>.background` | Optional background color; overrides `defaults.background`. |
+| `pages[].keys.<key>.foreground` | Optional icon and label color; overrides `defaults.foreground`. PNG and JPEG icons keep their own colors. |
+| `pages[].keys.<key>.glyph_scale` | Optional icon size, from `0.05` to `1.0`; overrides `defaults.glyph_scale`. |
+| `pages[].keys.<key>.action` | Optional action: `"none"`, `{ "run": "command" }`, or `{ "page": "next" }`, `{ "page": "prev" }`, or `{ "page": "name" }`. Defaults to `"none"`. |
+| `page_buttons.left` | Optional action for the left page button. Default: `{ "page": "prev" }`. |
+| `page_buttons.right` | Optional action for the right page button. Default: `{ "page": "next" }`. |
 
-A `run` command goes through `sh -c` and isn't waited on. To send keystrokes, use `osascript` or
-`tmux send-keys`.
+`next` and `prev` wrap around the page list. A named page target must exist; `next` and `prev`
+are reserved as navigation targets. Run actions must not be empty. They start through `sh -c`
+without blocking input, so only use configurations and commands you trust. Unknown configuration
+fields are rejected.
 
-Mistakes are reported with where they are, for example
-``pages[0].keys."10": keys are "1" to "9"``.
+## Use the library
 
-## Library
+Add the local crate and `hidapi` to your project's `Cargo.toml`. Replace the path with the path to
+your checkout:
+
+```toml
+[dependencies]
+mx-keypad = { path = "/path/to/mx-keypad" }
+hidapi = { version = "2", default-features = false }
+```
+
+Render the built-in bell icon and draw it on key 5:
 
 ```rust
-let api = hidapi::HidApi::new()?;
-if let Some(mut keypad) = mx_keypad::Keypad::open(&api)? {
-    let face = mx_keypad::render::Face { icon: Some(IconSource::Builtin("bell".into())), ..Default::default() };
-    keypad.draw(5, &mx_keypad::render::render_tile(&face, 118)?)?;
-    keypad.divert_page_buttons(true)?;
-    for event in keypad.poll(Duration::from_millis(200))? { /* Event::Down(Button::Key(5)) … */ }
+use mx_keypad::geometry::DISPLAY;
+use mx_keypad::render::{render_tile, Face, IconSource};
+use mx_keypad::Keypad;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let api = hidapi::HidApi::new()?;
+    if let Some(mut keypad) = Keypad::open(&api)? {
+        let face = Face {
+            icon: Some(IconSource::Builtin("bell".into())),
+            ..Face::default()
+        };
+        let tile = render_tile(&face, DISPLAY.key_size)?;
+        keypad.draw(5, &tile)?;
+    }
+    Ok(())
 }
 ```
 
-`Keypad::open` returns `Ok(None)` when no keypad is plugged in. It borrows your `HidApi` because
-hidapi allows only one per process.
+`Keypad::open` returns `Ok(None)` when no matching device is found. `Keypad` also provides
+`set_brightness`, `divert_page_buttons`, and `poll`; dropping it attempts to restore diverted page
+buttons.
 
-## Development
+## Develop
+
+Use the Nix development shell to run the tests and Clippy:
 
 ```sh
 nix develop -c cargo test
 nix develop -c cargo clippy --all-targets -- -D warnings
 ```
+
+The protocol code is ported from OpenLogi. See [NOTICE](NOTICE) for attribution and licenses and
+[PROTOCOL.md](PROTOCOL.md) for the device protocol. mx-keypad is licensed under MIT or Apache-2.0.
