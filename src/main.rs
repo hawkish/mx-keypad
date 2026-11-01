@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -11,15 +10,13 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hidapi::HidApi;
 
-use mx_keypad::blink;
 use mx_keypad::claim;
-use mx_keypad::config::{self, Action, Setup};
+use mx_keypad::config::{self, Setup};
 use mx_keypad::geometry::DISPLAY;
 use mx_keypad::keys::{self, Chord};
-use mx_keypad::press::{Fire, LongPress};
 use mx_keypad::render::{self, Face, Rgb};
-use mx_keypad::shift::{self, Shift};
-use mx_keypad::{Button, Event, KeyImageJpeg, Keypad};
+use mx_keypad::session::Session;
+use mx_keypad::{Event, KeyImageJpeg, Keypad};
 
 /// `eprintln!` with the local time in front, for the agent's log.
 macro_rules! log {
@@ -247,365 +244,70 @@ fn events() -> Result<()> {
 }
 
 /// The running setup and what the keypad currently shows.
-struct Runner {
-    path: PathBuf,
-    setup: Setup,
-    loaded: Option<SystemTime>,
-    page: usize,
-    children: Vec<Child>,
-    /// Rendered tiles by face, so a page is rendered once per config load.
-    tiles: HashMap<String, KeyImageJpeg>,
-    /// What each pressed button is holding until it is released.
-    held: HashMap<Button, Held>,
-    /// Keys with a long-press action, down and not yet decided.
-    long: LongPress<Button, Action>,
-    /// The shared start every blinking key counts its phase from.
-    blink_epoch: Instant,
-    /// The keypad's own shift.
-    shift: Shift<Button>,
-}
-
-impl Runner {
-    /// Draw the current page. Tiles come from the cache, and `Keypad::draw`
-    /// skips keys that already show theirs. A key that fails does not stop
-    /// the others; the first failure is returned once all were tried.
-    fn show(&mut self, keypad: &mut Keypad) -> Result<()> {
-        let now = Instant::now();
-        let mut first_error = None;
-        for i in 0..self.setup.pages[self.page].keys.len() {
-            let face = self.face(i, now);
-            // `Face` holds an f32, so it is keyed by its full Debug form.
-            let key = format!("{face:?}");
-            let tile = match self.tiles.get(&key) {
-                Some(tile) => tile.clone(),
-                None => {
-                    let tile = render::render_tile(&face, DISPLAY.key_size)?;
-                    self.tiles.insert(key, tile.clone());
-                    tile
-                }
-            };
-            if let Err(error) = keypad.draw(u8::try_from(i + 1)?, &tile) {
-                first_error.get_or_insert(error.context(format!("key {}", i + 1)));
+/// Draw the current page. Tiles come from `tiles` (rendered once per face,
+/// so a page is rendered once per config load), and `Keypad::draw` skips
+/// keys that already show theirs. A key that fails does not stop the
+/// others; the first failure is returned once all were tried.
+fn show(
+    session: &Session,
+    keypad: &mut Keypad,
+    tiles: &mut HashMap<String, KeyImageJpeg>,
+) -> Result<()> {
+    let now = Instant::now();
+    let mut first_error = None;
+    for i in 0..9 {
+        let face = session.face(i, now);
+        // `Face` holds an f32, so it is keyed by its full Debug form.
+        let key = format!("{face:?}");
+        let tile = match tiles.get(&key) {
+            Some(tile) => tile.clone(),
+            None => {
+                let tile = render::render_tile(&face, DISPLAY.key_size)?;
+                tiles.insert(key, tile.clone());
+                tile
             }
-        }
-        first_error.map_or(Ok(()), Err)
-    }
-
-    /// The face key `i` (0-based) of the current page shows at `now`: its
-    /// blink face during a blinking key's alternate phase.
-    fn face(&self, i: usize, now: Instant) -> Face {
-        let page = &self.setup.pages[self.page];
-        let face = if self.shift.active() {
-            &page.shifted_keys[i].0
-        } else {
-            &page.keys[i].0
         };
-        match &page.blink[i] {
-            Some(spec) if blink::alternate(self.blink_epoch, now, spec.interval) => {
-                spec.alternate(face)
-            }
-            _ => face.clone(),
+        if let Err(error) = keypad.draw(u8::try_from(i + 1)?, &tile) {
+            first_error.get_or_insert(error.context(format!("key {}", i + 1)));
         }
     }
-
-    /// When the next blinking key on the current page flips, if any blinks.
-    fn next_flip(&self, now: Instant) -> Option<Instant> {
-        self.setup.pages[self.page]
-            .blink
-            .iter()
-            .flatten()
-            .map(|spec| blink::next_flip(self.blink_epoch, now, spec.interval))
-            .min()
-    }
-
-    /// Take the page buttons over only when the setup uses them.
-    fn follow_page_buttons(&self, keypad: &mut Keypad) -> Result<()> {
-        keypad.divert_page_buttons(self.setup.needs_page_buttons())
-    }
-
-    /// Reload when the file changed; keep the old setup if the new one is
-    /// broken, so a half-saved edit does not blank the keypad.
-    fn reload(&mut self, keypad: &mut Keypad) -> Result<()> {
-        let modified = mtime(&self.path);
-        if modified == self.loaded {
-            return Ok(());
-        }
-        self.loaded = modified;
-        match Setup::load(&self.path) {
-            Ok(setup) => {
-                let name = &self.setup.pages[self.page].name;
-                self.page = setup
-                    .pages
-                    .iter()
-                    .position(|p| &p.name == name)
-                    .unwrap_or(0);
-                self.setup = setup;
-                self.long.set_threshold(self.setup.long_press);
-                // Image files may have changed along with the config.
-                self.tiles.clear();
-                self.follow_page_buttons(keypad)?;
-                if let Some(level) = self.setup.brightness {
-                    keypad.set_brightness(level)?;
-                }
-                log!("reloaded {}", self.path.display());
-                self.show(keypad)
-            }
-            Err(error) => {
-                log!("{error:#}; keeping the previous setup");
-                Ok(())
-            }
-        }
-    }
-
-    /// The long-press action `button` has on the current page, if any.
-    fn long_action(&self, button: Button) -> Option<Action> {
-        match button {
-            Button::Key(n) => {
-                let page = &self.setup.pages[self.page];
-                let long = if self.shift.active() {
-                    &page.shifted_long
-                } else {
-                    &page.long
-                };
-                long[usize::from(n) - 1].clone()
-            }
-            Button::PageLeft | Button::PageRight => None,
-        }
-    }
-
-    /// A key went down: act now, or start timing it when it has a long-press
-    /// action.
-    fn down(&mut self, keypad: &mut Keypad, button: Button) -> Result<()> {
-        let action = self.action(button);
-        match self.long_action(button) {
-            Some(long) => {
-                self.long.down(button, Instant::now(), action, long);
-                Ok(())
-            }
-            None => self.press(keypad, button, &action),
-        }
-    }
-
-    /// A key came up: decide a timed press, and let go of anything held.
-    fn up(&mut self, keypad: &mut Keypad, button: Button) -> Result<()> {
-        if let Some(Fire::Short(action) | Fire::Long(action)) = self.long.up(button, Instant::now())
-        {
-            self.press(keypad, button, &action)?;
-        }
-        self.release(keypad, button)
-    }
-
-    /// Fire the long-press actions of keys held past the threshold.
-    fn tick(&mut self, keypad: &mut Keypad) -> Result<()> {
-        for (button, action) in self.long.tick(Instant::now()) {
-            self.press(keypad, button, &action)?;
-        }
-        Ok(())
-    }
-
-    /// The action `button` has on the current page.
-    fn action(&self, button: Button) -> Action {
-        match button {
-            Button::Key(n) => {
-                let page = &self.setup.pages[self.page];
-                let keys = if self.shift.active() {
-                    &page.shifted_keys
-                } else {
-                    &page.keys
-                };
-                keys[usize::from(n) - 1].1.clone()
-            }
-            Button::PageLeft => self.setup.left.clone(),
-            Button::PageRight => self.setup.right.clone(),
-        }
-    }
-
-    /// `button` went down with `action` bound to it.
-    fn press(&mut self, keypad: &mut Keypad, button: Button, action: &Action) -> Result<()> {
-        if let Action::Shift(mode) = action {
-            self.shift.press(button, shift::Mode::parse(mode)?);
-            return self.show(keypad);
-        }
-        let result = self.perform_action(keypad, button, action);
-        // A `once` shift is spent by the next grid key, whatever it did.
-        if matches!(button, Button::Key(_)) && self.shift.consume() {
-            self.show(keypad)?;
-        }
-        result
-    }
-
-    /// Do what `action` says, for `button`.
-    fn perform_action(
-        &mut self,
-        keypad: &mut Keypad,
-        button: Button,
-        action: &Action,
-    ) -> Result<()> {
-        match action {
-            Action::Page(_) => {
-                if let Some(to) = self.setup.target(self.page, action) {
-                    if to != self.page {
-                        self.page = to;
-                        self.show(keypad)?;
-                    }
-                }
-            }
-            Action::Hold(chord) => {
-                let resolved = Chord::parse(chord)?.resolve();
-                keys::press_modifiers(resolved.modifiers, true)?;
-                keys::press_key(resolved, true)?;
-                self.held.insert(button, Held::Hold(resolved));
-            }
-            Action::Switch(chord) => {
-                let resolved = Chord::parse(chord)?.resolve();
-                keys::press_modifiers(resolved.modifiers, true)?;
-                keys::press_key(resolved, true)?;
-                keys::press_key(resolved, false)?;
-                self.held.insert(button, Held::Switch(resolved.modifiers));
-            }
-            Action::Sequence(steps) => {
-                // Resolve shortcuts here, on the main thread, where the
-                // keyboard layout API must be called; delays then run off it.
-                let steps = steps.iter().map(prepare).collect::<Result<Vec<_>>>()?;
-                std::thread::spawn(move || {
-                    for step in &steps {
-                        if let Err(error) = perform(step, true) {
-                            log!("sequence stopped: {error:#}");
-                            break;
-                        }
-                    }
-                });
-            }
-            action => {
-                if let Some(child) = perform(&prepare(action)?, false)? {
-                    self.children.push(child);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// `button` came up: let go of whatever its press is holding.
-    fn release(&mut self, keypad: &mut Keypad, button: Button) -> Result<()> {
-        if self.shift.release(button) {
-            self.show(keypad)?;
-        }
-        match self.held.remove(&button) {
-            Some(held) => held.release(),
-            None => Ok(()),
-        }
-    }
-
-    /// Let go of everything held, when the session ends.
-    fn release_all(&mut self) {
-        self.long.clear();
-        self.shift.clear();
-        for (_, held) in self.held.drain() {
-            if let Err(error) = held.release() {
-                log!("{error:#}");
-            }
-        }
-    }
+    first_error.map_or(Ok(()), Err)
 }
 
-/// Input a pressed key is holding down until it is released.
-enum Held {
-    /// A `hold` shortcut: its key and modifiers.
-    Hold(keys::Resolved),
-    /// A `switch` shortcut: its modifiers.
-    Switch(keys::Modifiers),
+/// Take the page buttons over only when the setup uses them.
+fn follow_page_buttons(session: &Session, keypad: &mut Keypad) -> Result<()> {
+    keypad.divert_page_buttons(session.needs_page_buttons())
 }
 
-impl Held {
-    fn release(self) -> Result<()> {
-        match self {
-            Held::Hold(resolved) => {
-                keys::press_key(resolved, false)?;
-                keys::press_modifiers(resolved.modifiers, false)
+/// Reload when the file changed; keep the old setup if the new one is
+/// broken, so a half-saved edit does not blank the keypad.
+fn reload(
+    session: &mut Session,
+    path: &Path,
+    loaded: &mut Option<SystemTime>,
+    keypad: &mut Keypad,
+    tiles: &mut HashMap<String, KeyImageJpeg>,
+) -> Result<()> {
+    let modified = mtime(path);
+    if modified == *loaded {
+        return Ok(());
+    }
+    *loaded = modified;
+    match Setup::load(path) {
+        Ok(setup) => {
+            session.reload(setup);
+            // Image files may have changed along with the config.
+            tiles.clear();
+            follow_page_buttons(session, keypad)?;
+            if let Some(level) = session.brightness() {
+                keypad.set_brightness(level)?;
             }
-            Held::Switch(modifiers) => keys::press_modifiers(modifiers, false),
+            log!("reloaded {}", path.display());
+            show(session, keypad, tiles)
         }
-    }
-}
-
-/// An action ready to perform on any thread: shortcuts already resolved.
-enum Step {
-    Nothing,
-    Run(String),
-    Open(Vec<String>),
-    Tap(keys::Resolved),
-    Text(String),
-    Media(keys::MediaKey),
-    Mouse(keys::MouseButton),
-    Delay(Duration),
-}
-
-/// Make `action` ready to perform. Page, hold, switch and sequence are
-/// handled by [`Runner::press`] and never get here.
-fn prepare(action: &Action) -> Result<Step> {
-    Ok(match action {
-        Action::None | Action::Page(_) | Action::Hold(_) | Action::Switch(_) | Action::Shift(_) => {
-            Step::Nothing
-        }
-        Action::Sequence(_) => anyhow::bail!("a sequence cannot contain a sequence"),
-        Action::Run(command) => Step::Run(command.clone()),
-        Action::Open(target) => Step::Open(open_args(target)),
-        Action::Keys(chord) => Step::Tap(Chord::parse(chord)?.resolve()),
-        Action::Text(text) => Step::Text(text.clone()),
-        Action::Media(name) => Step::Media(keys::MediaKey::parse(name)?),
-        Action::Mouse(name) => Step::Mouse(keys::MouseButton::parse(name)?),
-        Action::System(name) => match name.as_str() {
-            "sleep" => Step::Run("pmset sleepnow".into()),
-            "display-sleep" => Step::Run("pmset displaysleepnow".into()),
-            _ => Step::Tap(Chord::parse("ctrl+cmd+q")?.resolve()),
-        },
-        Action::Delay(ms) => Step::Delay(Duration::from_millis(*ms)),
-    })
-}
-
-/// `open`'s arguments for `target`: an app by name, or a URL or path.
-fn open_args(target: &str) -> Vec<String> {
-    let target = target.trim();
-    let expanded = match (target.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => Path::new(&home).join(rest).display().to_string(),
-        _ => target.to_string(),
-    };
-    let is_location = target.contains("://")
-        || target.starts_with("mailto:")
-        || target.starts_with('/')
-        || target.starts_with('~')
-        || target.starts_with('.');
-    if is_location {
-        vec![expanded]
-    } else {
-        vec!["-a".into(), expanded]
-    }
-}
-
-/// Perform `step`. A command started by `run` or `open` is returned to be
-/// reaped later, or waited for when `wait` (inside a sequence, so steps
-/// stay in order).
-fn perform(step: &Step, wait: bool) -> Result<Option<Child>> {
-    let spawn = |command: &mut Command| -> Result<Option<Child>> {
-        command.stdin(Stdio::null());
-        if wait {
-            command.status().context("cannot run a command")?;
-            Ok(None)
-        } else {
-            Ok(Some(command.spawn().context("cannot run a command")?))
-        }
-    };
-    match step {
-        Step::Nothing => Ok(None),
-        Step::Run(command) => spawn(Command::new("sh").arg("-c").arg(command)),
-        Step::Open(args) => spawn(Command::new("/usr/bin/open").args(args)),
-        Step::Tap(resolved) => keys::tap(*resolved).map(|()| None),
-        Step::Text(text) => keys::type_text(text).map(|()| None),
-        Step::Media(key) => keys::send_media(*key).map(|()| None),
-        Step::Mouse(button) => keys::click(*button).map(|()| None),
-        Step::Delay(delay) => {
-            std::thread::sleep(*delay);
-            Ok(None)
+        Err(error) => {
+            log!("{error:#}; keeping the previous setup");
+            Ok(())
         }
     }
 }
@@ -625,19 +327,9 @@ fn run(path: &Path) -> Result<()> {
              Privacy & Security → Accessibility; they fail until then"
         );
     }
-    let setup_long_press = setup.long_press;
-    let mut runner = Runner {
-        path: path.to_path_buf(),
-        loaded: mtime(path),
-        setup,
-        page: 0,
-        children: Vec::new(),
-        tiles: HashMap::new(),
-        held: HashMap::new(),
-        long: LongPress::new(setup_long_press),
-        blink_epoch: Instant::now(),
-        shift: Shift::default(),
-    };
+    let mut session = Session::new(setup);
+    let mut loaded = mtime(path);
+    let mut tiles: HashMap<String, KeyImageJpeg> = HashMap::new();
     let mut api = HidApi::new()?;
     let mut waiting = false;
     // Sessions in a row that ended in an error before running `STABLE`.
@@ -669,8 +361,8 @@ fn run(path: &Path) -> Result<()> {
             waiting = false;
         }
         let started = Instant::now();
-        let served = session(&mut runner, &mut keypad, &stop);
-        runner.release_all();
+        let served = connect(&mut session, &mut keypad, path, &mut loaded, &mut tiles, &stop);
+        session.release_all();
         let error = match served {
             // Blank the keys on the way out: images left behind would look
             // live while nothing answers the presses.
@@ -680,7 +372,7 @@ fn run(path: &Path) -> Result<()> {
                 // The claimant draws next: drop without clearing, and wait
                 // for the claim to go away before reopening and redrawing.
                 drop(keypad);
-                runner.tiles.clear();
+                tiles.clear();
                 while claim::foreign().is_some() {
                     if sleep_unless_stopped(Duration::from_secs(1), &stop) {
                         return Ok(());
@@ -722,18 +414,32 @@ enum Outcome {
 
 /// Set up a freshly opened keypad and serve it until `stop`, an error, or a
 /// foreign claim.
-fn session(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<Outcome> {
-    runner.follow_page_buttons(keypad)?;
-    if let Some(level) = runner.setup.brightness {
+fn connect(
+    session: &mut Session,
+    keypad: &mut Keypad,
+    path: &Path,
+    loaded: &mut Option<SystemTime>,
+    tiles: &mut HashMap<String, KeyImageJpeg>,
+    stop: &AtomicBool,
+) -> Result<Outcome> {
+    follow_page_buttons(session, keypad)?;
+    if let Some(level) = session.brightness() {
         keypad.set_brightness(level)?;
     }
-    runner.show(keypad)?;
-    serve(runner, keypad, stop)
+    show(session, keypad, tiles)?;
+    serve(session, keypad, path, loaded, tiles, stop)
 }
 
 /// Act on presses and config changes until `stop` is set or a foreign claim
 /// on the keypad appears.
-fn serve(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<Outcome> {
+fn serve(
+    session: &mut Session,
+    keypad: &mut Keypad,
+    path: &Path,
+    loaded: &mut Option<SystemTime>,
+    tiles: &mut HashMap<String, KeyImageJpeg>,
+    stop: &AtomicBool,
+) -> Result<Outcome> {
     while !stop.load(Ordering::Relaxed) {
         if let Some((pid, owner)) = claim::foreign() {
             return Ok(Outcome::Yielding(pid, owner));
@@ -741,33 +447,30 @@ fn serve(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<
         // Wake in time for a long press to fire while the key is held, and
         // for the next blink.
         let now = Instant::now();
-        let flip = runner.next_flip(now);
-        let wake = [runner.long.next_deadline(), flip]
-            .into_iter()
-            .flatten()
-            .min();
+        let flip = session.next_flip(now);
+        let wake = [session.next_deadline(), flip].into_iter().flatten().min();
         let timeout = wake.map_or(TICK, |at| at.saturating_duration_since(now).min(TICK));
         for event in poll(keypad, stop, timeout)? {
             let result = match event {
-                Event::Down(button) => runner.down(keypad, button),
-                Event::Up(button) => runner.up(keypad, button),
+                Event::Down(button) => session.down(button),
+                Event::Up(button) => session.up(button),
             };
             if let Err(error) = result {
                 log!("{error:#}");
             }
         }
-        if let Err(error) = runner.tick(keypad) {
-            log!("{error:#}");
+        for (_, result) in session.tick() {
+            if let Err(error) = result {
+                log!("{error:#}");
+            }
         }
         if flip.is_some_and(|at| Instant::now() >= at) {
-            if let Err(error) = runner.show(keypad) {
+            if let Err(error) = show(session, keypad, tiles) {
                 log!("blink: {error:#}");
             }
         }
-        runner
-            .children
-            .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
-        runner.reload(keypad)?;
+        session.reap();
+        reload(session, path, loaded, keypad, tiles)?;
     }
     Ok(Outcome::Stopped)
 }
@@ -817,7 +520,7 @@ fn timestamp() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{open_args, timestamp};
+    use super::timestamp;
 
     #[test]
     fn timestamps_read_as_local_date_and_time() {
@@ -827,15 +530,5 @@ mod tests {
             .map(|c| if c.is_ascii_digit() { '9' } else { c })
             .collect();
         assert_eq!(shape, "9999-99-99 99:99:99", "{stamp}");
-    }
-
-    #[test]
-    fn open_takes_names_as_apps_and_the_rest_as_locations() {
-        assert_eq!(open_args("Safari"), ["-a", "Safari"]);
-        assert_eq!(open_args("System Settings"), ["-a", "System Settings"]);
-        assert_eq!(open_args("https://example.com"), ["https://example.com"]);
-        assert_eq!(open_args("/Applications"), ["/Applications"]);
-        let home = std::env::var("HOME").unwrap();
-        assert_eq!(open_args("~/Downloads"), [format!("{home}/Downloads")]);
     }
 }

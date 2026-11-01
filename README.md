@@ -326,6 +326,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 buttons. The `mx_keypad::keys` module posts shortcuts and typed text on macOS, and reports whether
 the process is trusted for Accessibility.
 
+### Running a config
+
+`mx_keypad::session::Session` is the engine behind `mx-keypad run`: given a `config::Setup`, it
+decides what each key shows (`Session::face`, blink- and shift-aware) and performs an action's side
+effects when told a button went down or up (`Session::down`, `Session::up`), including held `hold`
+and `switch` shortcuts, `sequence` steps on a background thread, and the keypad's own shift. A
+`Session` never touches a `Keypad` or a terminal — reading presses, drawing tiles, diverting the
+page buttons, and reloading the config from disk stay the caller's job, which is what keeps it
+usable by a program that only wants to borrow the keypad for one of its own pages alongside
+something else, such as tmux-legion's agent-status page:
+
+```rust
+use mx_keypad::config::Setup;
+use mx_keypad::session::Session;
+use mx_keypad::Button;
+
+fn demo() -> anyhow::Result<()> {
+    let setup = Setup::load("config.json".as_ref())?;
+    let mut session = Session::new(setup);
+
+    // Wire these to a Keypad's events and a redraw loop; see `mx-keypad
+    // run`'s own `connect`/`serve` for the full shape, including
+    // reconnecting and reloading the config file.
+    session.down(Button::Key(1))?;
+    let face_for_key_one = session.face(0, std::time::Instant::now());
+    let _ = face_for_key_one;
+    Ok(())
+}
+```
+
 ## Develop
 
 Use the Nix development shell to run the tests and Clippy:

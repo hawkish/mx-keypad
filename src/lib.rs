@@ -16,6 +16,7 @@ pub mod input;
 pub mod keys;
 pub mod press;
 pub mod render;
+pub mod session;
 pub mod shift;
 mod vendor;
 
