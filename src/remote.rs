@@ -659,14 +659,13 @@ mod tests {
     struct Sandbox(PathBuf);
     impl Sandbox {
         fn new() -> Self {
-            // Short enough for macOS's sockaddr_un even with its long TMPDIR.
+            // Short enough for macOS's sockaddr_un even with its long TMPDIR,
+            // and numbered, so tests running in parallel never share one.
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let dir = std::env::temp_dir().join(format!(
                 "mxr-{}-{}",
                 std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .subsec_nanos()
+                NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(&dir).unwrap();
             Self(dir)

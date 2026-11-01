@@ -332,41 +332,48 @@ fn fontdb() -> &'static Arc<usvg::fontdb::Database> {
     })
 }
 
+/// The most of the tile's width and height a centred label's ink may cover.
+const FILL: f32 = 0.75;
+
 /// Draw `label` under the icon, or, with `centred` set to a glyph scale, as
-/// the whole face: as tall as that share of the tile, shrunk to fit its width.
+/// the whole face. Each `\n` starts a new line. A centred label is set at
+/// that share of the tile, then measured and shrunk until its ink fits inside
+/// [`FILL`] of the tile, and centred on that ink — so a short word is as big as a
+/// letter key, and a longer one as big as the tile allows.
 fn draw_label(
     pixmap: &mut tiny_skia::Pixmap,
     label: &str,
     colour: Rgb,
     centred: Option<f32>,
 ) -> Result<(), RenderError> {
-    // XML markup is not allowed in labels; discard characters XML cannot represent.
-    let text = label.chars().filter(|&c| matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}'))
-        .fold(String::new(), |mut out, c| {
-            match c {
-                '&' => out.push_str("&amp;"), '<' => out.push_str("&lt;"),
-                '>' => out.push_str("&gt;"), _ => out.push(c),
-            }
-            out
-        });
-    let side = pixmap.width();
-    #[allow(clippy::cast_precision_loss)]
-    let (font_size, baseline) = match centred {
+    let side = pixmap.width() as f32;
+    let lines: Vec<String> = label.lines().map(escape).collect();
+    let (font_size, line_height) = match centred {
         Some(scale) => {
-            // Allow 0.85 em per character, enough for wide letters such as Æ
-            // and W; keep the line inside
-            // 90 % of the tile, and drop the baseline by about a third of
-            // the size so capitals sit centred.
-            let chars = label.chars().count().max(1) as f32;
-            let size =
-                (side as f32 * scale.clamp(0.05, 1.0)).min(side as f32 * 0.9 / (chars * 0.85));
-            (size, side as f32 / 2.0 + size * 0.35)
+            let size = side * scale.clamp(0.05, 1.0);
+            (size, size * 1.15)
         }
-        None => (side as f32 * 0.16, side as f32 * 0.88),
+        None => (side * 0.16, side * 0.16 * 1.1),
     };
+    let texts: String = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            // Under an icon the last line sits on the old single-line
+            // baseline and earlier lines stack above it.
+            let y = match centred {
+                Some(_) => font_size + i as f32 * line_height,
+                None => side * 0.88 - (lines.len() - 1 - i) as f32 * line_height,
+            };
+            format!(
+                "<text x=\"{x}\" y=\"{y}\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"{font_size}\" fill=\"{fill}\">{line}</text>",
+                x = side / 2.0,
+                fill = colour.hex(),
+            )
+        })
+        .collect();
     let svg = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{side}\" height=\"{side}\"><text x=\"50%\" y=\"{baseline}\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"{font_size}\" fill=\"{}\">{text}</text></svg>",
-        colour.hex(),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{side}\" height=\"{side}\">{texts}</svg>"
     );
     let options = usvg::Options {
         fontdb: Arc::clone(fontdb()),
@@ -376,12 +383,41 @@ fn draw_label(
         what: "label".to_owned(),
         message: error.to_string(),
     })?;
-    resvg::render(
-        &tree,
-        tiny_skia::Transform::identity(),
-        &mut pixmap.as_mut(),
-    );
+    let transform = match centred {
+        Some(_) => {
+            let ink = tree.root().abs_bounding_box();
+            if ink.width() <= 0.0 || ink.height() <= 0.0 {
+                return Ok(()); // nothing drawable, e.g. no fonts at all
+            }
+            let fit = (side * FILL / ink.width())
+                .min(side * FILL / ink.height())
+                .min(1.0);
+            let (cx, cy) = (ink.x() + ink.width() / 2.0, ink.y() + ink.height() / 2.0);
+            tiny_skia::Transform::from_scale(fit, fit)
+                .post_translate(side / 2.0 - cx * fit, side / 2.0 - cy * fit)
+        }
+        None => tiny_skia::Transform::identity(),
+    };
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
     Ok(())
+}
+
+/// `line` made safe as SVG text: XML's special characters escaped, and the
+/// characters XML cannot represent at all dropped.
+fn escape(line: &str) -> String {
+    line.chars()
+        .filter(|&c| {
+            matches!(c, '\t' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
+        })
+        .fold(String::new(), |mut out, c| {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                _ => out.push(c),
+            }
+            out
+        })
 }
 
 /// JPEG qualities tried in turn until a tile fits one image packet.
@@ -525,6 +561,44 @@ mod tests {
             let decoded = image::load_from_memory(jpeg.as_bytes()).unwrap().to_rgb8();
             assert!(decoded.pixels().any(|p| p[0] > 100));
         }
+    }
+
+    /// The rows of `jpeg` that hold any light pixel, as (first, last).
+    fn ink_rows(jpeg: &KeyImageJpeg) -> Option<(u32, u32)> {
+        let decoded = image::load_from_memory(jpeg.as_bytes()).unwrap().to_rgb8();
+        let rows: Vec<u32> = (0..decoded.height())
+            .filter(|&y| (0..decoded.width()).any(|x| decoded.get_pixel(x, y)[0] > 128))
+            .collect();
+        Some((*rows.first()?, *rows.last()?))
+    }
+
+    #[test]
+    fn a_line_break_draws_two_lines_and_a_word_fills_the_key() {
+        if fontdb().faces().next().is_none() {
+            return;
+        }
+        let tile = |label: &str| {
+            render_tile(
+                &Face {
+                    label: Some(label.into()),
+                    ..Face::default()
+                },
+                118,
+            )
+            .unwrap()
+        };
+        let (top, bottom) = ink_rows(&tile("switch")).unwrap();
+        let one_line = bottom - top;
+        let (top, bottom) = ink_rows(&tile("nh\nswitch")).unwrap();
+        assert!(
+            bottom - top > one_line * 3 / 2,
+            "two lines are taller than one"
+        );
+        // The old estimate drew "switch" about 16 px tall; measuring the ink
+        // lets it grow to the tile's width.
+        assert!(one_line > 20, "switch is drawn {one_line} px tall");
+        // And it stays inside the tile, centred.
+        assert!(top >= 4 && bottom <= 114, "{top}..{bottom}");
     }
 
     #[test]

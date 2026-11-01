@@ -180,7 +180,7 @@ This example uses one page and nine keys. Save it as a JSON file and pass its pa
 | `pages[].name` | Required, unique page name. Use it as a page action's target. |
 | `pages[].keys` | Optional object mapping key numbers `"1"`–`"9"` to key settings, in row-major order from the top left. Omitted keys have the default background and no icon, label, or action. |
 | `pages[].keys.<key>.icon` | Optional built-in name from `mx-keypad icons`, or a path to an `.svg`, `.png`, `.jpg`, or `.jpeg` file. Relative paths resolve from the config file's directory; `~/` resolves from `HOME`. SVG `currentColor` uses the foreground color. |
-| `pages[].keys.<key>.label` | Optional text drawn near the bottom of the key. On a key without an icon, the label is the face: large and centred, sized by `glyph_scale`. Labels use system fonts. |
+| `pages[].keys.<key>.label` | Optional text drawn near the bottom of the key. On a key without an icon, the label is the face: centred, sized by `glyph_scale`, and shrunk until it fits within 75 % of the key. `\n` starts a new line, as in `"nh\nswitch"`. Labels use system fonts. |
 | `pages[].keys.<key>.background` | Optional background color; overrides `defaults.background`. |
 | `pages[].keys.<key>.foreground` | Optional icon and label color; overrides `defaults.foreground`. PNG and JPEG icons keep their own colors. |
 | `pages[].keys.<key>.glyph_scale` | Optional icon size, from `0.05` to `1.0`; overrides `defaults.glyph_scale`. |
