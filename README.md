@@ -52,7 +52,9 @@ mx-keypad run --config examples/demo.json
 `run` shows the first page, executes actions on press, and checks for configuration changes. If a
 changed file fails validation, it reports the error and keeps the previous configuration. If the
 keypad isn't connected, or is unplugged while running, `run` waits and reconnects automatically
-instead of exiting. Both `run` and `events` take over the page buttons while active and attempt to
+instead of exiting. If a session fails quickly after reconnecting, `run` backs off before trying
+again, doubling the delay up to 32 seconds, and resets the backoff once a session has stayed up for
+30 seconds. Both `run` and `events` take over the page buttons while active and attempt to
 return them to the firmware on exit, including Ctrl-C and SIGTERM. When `run` ends a session, it
 also attempts to blank all nine keys.
 
@@ -228,3 +230,4 @@ nix develop -c cargo clippy --all-targets -- -D warnings
 
 The protocol code is ported from OpenLogi. See [NOTICE](NOTICE) for attribution and licenses and
 [PROTOCOL.md](PROTOCOL.md) for the device protocol. mx-keypad is licensed under MIT or Apache-2.0.
+```

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -18,6 +18,9 @@ use mx_keypad::{Button, Event, Keypad};
 
 #[cfg(target_os = "macos")]
 mod service;
+
+/// A session that ran this long before failing resets the backoff.
+const STABLE: Duration = Duration::from_secs(30);
 
 /// How often `run` wakes to check for a config change or a signal.
 const TICK: Duration = Duration::from_millis(200);
@@ -283,17 +286,16 @@ fn run(path: &Path) -> Result<()> {
     };
     let mut api = HidApi::new()?;
     let mut waiting = false;
+    // Sessions in a row that ended in an error before running `STABLE`.
+    let mut failures = 0u32;
     while !stop.load(Ordering::Relaxed) {
         let Some(mut keypad) = Keypad::open(&api)? else {
             if !waiting {
                 eprintln!("waiting for the MX Creative Keypad (USB)");
                 waiting = true;
             }
-            for _ in 0..5 {
-                if stop.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                std::thread::sleep(TICK);
+            if sleep_unless_stopped(Duration::from_secs(1), &stop) {
+                return Ok(());
             }
             api.refresh_devices()?;
             continue;
@@ -302,14 +304,26 @@ fn run(path: &Path) -> Result<()> {
             eprintln!("keypad connected");
             waiting = false;
         }
+        let started = Instant::now();
         let served = session(&mut runner, &mut keypad, &stop);
         // Blank the keys on the way out, whatever ended the session: images
         // left behind would look live while nothing answers the presses.
         let cleared = keypad.clear();
-        match served {
+        let error = match served {
             Ok(()) => return cleared,
-            // Unplugged, most likely: wait for it to come back.
-            Err(error) => eprintln!("{error:#}; reconnecting"),
+            Err(error) => error,
+        };
+        // Unplugged, or the keypad refused a write. Back off before trying
+        // again, longer each time a session fails quickly, so a keypad that
+        // keeps refusing is not flooded with retries.
+        if started.elapsed() > STABLE {
+            failures = 0;
+        }
+        failures = (failures + 1).min(5);
+        let delay = Duration::from_secs(1 << failures);
+        eprintln!("{error:#}; reconnecting in {}s", delay.as_secs());
+        if sleep_unless_stopped(delay, &stop) {
+            return Ok(());
         }
         drop(keypad);
         api.refresh_devices()?;
@@ -358,4 +372,16 @@ fn poll(keypad: &mut Keypad, stop: &AtomicBool) -> Result<Vec<Event>> {
         Err(_) if stop.load(Ordering::Relaxed) => Ok(Vec::new()),
         result => result,
     }
+}
+
+/// Sleep for `delay` in ticks; `true` when `stop` was set meanwhile.
+fn sleep_unless_stopped(delay: Duration, stop: &AtomicBool) -> bool {
+    let deadline = Instant::now() + delay;
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        std::thread::sleep(TICK);
+    }
+    stop.load(Ordering::Relaxed)
 }
