@@ -11,4 +11,7 @@ OpenLogi's image-write layout follows node-logitech-mx-creative-console
 (MIT).
 
 The icons in icons/ are from Lucide (https://lucide.dev), ISC License,
-Copyright (c) Lucide Contributors, by way of OpenLogi.
+Copyright (c) Lucide Contributors, by way of OpenLogi, except for the
+agent icons: claude.svg and codex.svg are the Claude and OpenAI marks
+from Simple Icons (https://simpleicons.org, CC0 1.0), trademarks of
+their owners, and copilot.svg is drawn for this project.

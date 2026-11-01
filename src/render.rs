@@ -135,7 +135,10 @@ icons!(
     "circle-arrow-left",
     "circle-arrow-right",
     "circle-dot",
+    "claude",
     "clipboard-paste",
+    "codex",
+    "copilot",
     "copy",
     "dot",
     "file",
@@ -611,7 +614,7 @@ mod tests {
 
     #[test]
     fn all_builtin_icons_render() {
-        assert_eq!(builtin_icon_names().count(), 70);
+        assert_eq!(builtin_icon_names().count(), 73);
         for name in builtin_icon_names() {
             let face = Face {
                 icon: Some(IconSource::Builtin(name.into())),
