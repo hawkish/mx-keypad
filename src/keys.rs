@@ -32,7 +32,8 @@ pub struct Modifiers {
 
 impl Chord {
     /// Parse `"cmd+ctrl+q"`: modifiers and one key, joined by `+`, any case.
-    /// A literal plus is `plus`.
+    /// `plus` names the `=`/`+` key, since `+` is the separator; add `shift`
+    /// to get `+`.
     pub fn parse(text: &str) -> Result<Chord> {
         let mut modifiers = Modifiers::default();
         let mut key = None;
