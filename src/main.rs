@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use hidapi::HidApi;
 
 use mx_keypad::blink;
+use mx_keypad::claim;
 use mx_keypad::config::{self, Action, Setup};
 use mx_keypad::geometry::DISPLAY;
 use mx_keypad::keys::{self, Chord};
@@ -642,6 +643,16 @@ fn run(path: &Path) -> Result<()> {
     // Sessions in a row that ended in an error before running `STABLE`.
     let mut failures = 0u32;
     while !stop.load(Ordering::Relaxed) {
+        if let Some((pid, owner)) = claim::foreign() {
+            log!("yielding to {owner} (pid {pid})");
+            while claim::foreign().is_some() {
+                if sleep_unless_stopped(Duration::from_secs(1), &stop) {
+                    return Ok(());
+                }
+            }
+            api.refresh_devices()?;
+            continue;
+        }
         let Some(mut keypad) = Keypad::open(&api)? else {
             if !waiting {
                 log!("waiting for the MX Creative Keypad (USB)");
@@ -660,12 +671,28 @@ fn run(path: &Path) -> Result<()> {
         let started = Instant::now();
         let served = session(&mut runner, &mut keypad, &stop);
         runner.release_all();
-        // Blank the keys on the way out, whatever ended the session: images
-        // left behind would look live while nothing answers the presses.
-        let cleared = keypad.clear();
         let error = match served {
-            Ok(()) => return cleared,
-            Err(error) => error,
+            // Blank the keys on the way out: images left behind would look
+            // live while nothing answers the presses.
+            Ok(Outcome::Stopped) => return keypad.clear(),
+            Ok(Outcome::Yielding(pid, owner)) => {
+                log!("yielding to {owner} (pid {pid})");
+                // The claimant draws next: drop without clearing, and wait
+                // for the claim to go away before reopening and redrawing.
+                drop(keypad);
+                runner.tiles.clear();
+                while claim::foreign().is_some() {
+                    if sleep_unless_stopped(Duration::from_secs(1), &stop) {
+                        return Ok(());
+                    }
+                }
+                api.refresh_devices()?;
+                continue;
+            }
+            Err(error) => {
+                let _ = keypad.clear();
+                error
+            }
         };
         // Unplugged, or the keypad refused a write. Back off before trying
         // again, longer each time a session fails quickly, so a keypad that
@@ -679,14 +706,23 @@ fn run(path: &Path) -> Result<()> {
         if sleep_unless_stopped(delay, &stop) {
             return Ok(());
         }
-        drop(keypad);
         api.refresh_devices()?;
     }
     Ok(())
 }
 
-/// Set up a freshly opened keypad and serve it until `stop` or an error.
-fn session(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<()> {
+/// What ended a serving session.
+enum Outcome {
+    /// The stop signal fired.
+    Stopped,
+    /// A foreign claim appeared: `run` steps aside without clearing the
+    /// keypad, since the claimant draws next.
+    Yielding(u32, String),
+}
+
+/// Set up a freshly opened keypad and serve it until `stop`, an error, or a
+/// foreign claim.
+fn session(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<Outcome> {
     runner.follow_page_buttons(keypad)?;
     if let Some(level) = runner.setup.brightness {
         keypad.set_brightness(level)?;
@@ -695,9 +731,13 @@ fn session(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Resul
     serve(runner, keypad, stop)
 }
 
-/// Act on presses and config changes until `stop` is set.
-fn serve(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<()> {
+/// Act on presses and config changes until `stop` is set or a foreign claim
+/// on the keypad appears.
+fn serve(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<Outcome> {
     while !stop.load(Ordering::Relaxed) {
+        if let Some((pid, owner)) = claim::foreign() {
+            return Ok(Outcome::Yielding(pid, owner));
+        }
         // Wake in time for a long press to fire while the key is held, and
         // for the next blink.
         let now = Instant::now();
@@ -729,7 +769,7 @@ fn serve(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<
             .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
         runner.reload(keypad)?;
     }
-    Ok(())
+    Ok(Outcome::Stopped)
 }
 
 /// Presses within one tick. A read the signal interrupted is the signal, not

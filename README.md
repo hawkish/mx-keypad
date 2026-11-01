@@ -3,8 +3,9 @@
 Control the Logitech MX Creative Keypad over USB with a JSON configuration. Set images and actions
 for its nine 118 × 118 LCD keys, assign the two page buttons, and adjust panel brightness.
 
-The Rust library exposes the same device operations without an async runtime. A planned use is to
-show AI-agent status from tmux-legion; that integration isn't built yet.
+The Rust library exposes the same device operations without an async runtime, including a claim
+mechanism so another program, such as tmux-legion's sidebar, can borrow the keypad and hand it
+back. See [Hand the keypad to another program](#hand-the-keypad-to-another-program).
 
 ## Install and check a configuration
 
@@ -64,6 +65,22 @@ keys.
 
 `run` caches rendered tiles and skips drawing keys whose images haven't changed. A refused image is
 retried before reconnecting. On macOS, `run` empties the agent log at startup if it's over 1 MiB.
+
+## Hand the keypad to another program
+
+macOS `hidapi` opens the keypad exclusively, so `run` can share it with another program, such as
+tmux-legion's sidebar, by taking turns instead of at the same time. The other program takes a
+*claim*: a file at `$XDG_STATE_HOME/mx-keypad/claim`, or `~/.local/state/mx-keypad/claim` if
+`XDG_STATE_HOME` isn't set, naming its pid and itself. `run` checks for a foreign claim before
+every attempt to open the keypad, and once a tick while serving one.
+
+When a foreign claim appears, `run` logs "yielding to \<owner\> (pid \<pid\>)" and drops the keypad
+without clearing it, since the claimant draws next. It waits until the claim is gone, then reopens
+and redraws, as it would after a reconnect. A claim left behind by a killed process doesn't count,
+so it expires on its own the next time `run` checks.
+
+`mx_keypad::claim::Claim::acquire(owner)` takes the claim for the calling process; dropping it
+releases the claim, unless another process's claim has since replaced it.
 
 ## Start at login on macOS
 

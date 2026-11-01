@@ -6,6 +6,7 @@
 //! setup the `mx-keypad` binary runs.
 
 pub mod blink;
+pub mod claim;
 pub mod config;
 pub mod device;
 pub mod geometry;
