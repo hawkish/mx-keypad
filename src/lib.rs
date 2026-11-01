@@ -11,6 +11,7 @@ pub mod geometry;
 mod hidpp;
 pub mod image;
 pub mod input;
+pub mod keys;
 pub mod render;
 mod vendor;
 

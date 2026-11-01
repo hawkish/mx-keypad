@@ -123,6 +123,18 @@ pub enum Action {
     Run(String),
     /// Switch page: `"next"`, `"prev"`, or a page name.
     Page(String),
+    /// Press a shortcut, such as `"cmd+ctrl+q"` (macOS).
+    Keys(String),
+    /// Type a string (macOS).
+    Text(String),
+}
+
+impl Action {
+    /// Whether the action sends keystrokes, which needs Accessibility.
+    #[must_use]
+    pub fn sends_keys(&self) -> bool {
+        matches!(self, Action::Keys(_) | Action::Text(_))
+    }
 }
 
 /// The page buttons' actions.
@@ -176,6 +188,17 @@ pub struct ResolvedPage {
 }
 
 impl Setup {
+    /// Whether any key or page button sends keystrokes.
+    #[must_use]
+    pub fn sends_keys(&self) -> bool {
+        self.left.sends_keys()
+            || self.right.sends_keys()
+            || self
+                .pages
+                .iter()
+                .any(|page| page.keys.iter().any(|(_, action)| action.sends_keys()))
+    }
+
     /// Read and validate the config at `path`.
     pub fn load(path: &Path) -> Result<Setup> {
         let text = std::fs::read_to_string(path)
@@ -284,6 +307,10 @@ fn check_action(action: &Action, names: &[&str], at: &str) -> Result<()> {
             bail!("{at}: no page is named {to:?}")
         }
         Action::Run(command) if command.trim().is_empty() => bail!("{at}: empty command"),
+        Action::Text(text) if text.is_empty() => bail!("{at}: empty text"),
+        Action::Keys(chord) => crate::keys::Chord::parse(chord)
+            .map(drop)
+            .with_context(|| format!("{at}.keys")),
         _ => Ok(()),
     }
 }

@@ -12,8 +12,12 @@ use hidapi::HidApi;
 
 use mx_keypad::config::{self, Action, Setup};
 use mx_keypad::geometry::DISPLAY;
+use mx_keypad::keys::{self, Chord};
 use mx_keypad::render::{self, Face, Rgb};
 use mx_keypad::{Button, Event, Keypad};
+
+#[cfg(target_os = "macos")]
+mod service;
 
 /// How often `run` wakes to check for a config change or a signal.
 const TICK: Duration = Duration::from_millis(200);
@@ -69,6 +73,17 @@ enum Cmd {
     },
     /// Print key and page-button presses until interrupted.
     Events,
+    /// Run `run` as a LaunchAgent: at login, restarted if it stops, with its
+    /// own Accessibility permission.
+    #[cfg(target_os = "macos")]
+    Install {
+        /// Config file [default: ~/.config/mx-keypad/config.json]
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Stop and remove the LaunchAgent.
+    #[cfg(target_os = "macos")]
+    Uninstall,
     /// List the built-in icon names.
     Icons,
 }
@@ -102,6 +117,14 @@ fn main() -> Result<()> {
             open(&api)?.set_brightness(percent)
         }
         Cmd::Events => events(),
+        #[cfg(target_os = "macos")]
+        Cmd::Install { config } => {
+            let path = config.unwrap_or_else(config::default_path);
+            Setup::load(&path)?;
+            service::install(&path)
+        }
+        #[cfg(target_os = "macos")]
+        Cmd::Uninstall => service::uninstall(),
         Cmd::Icons => {
             for name in render::builtin_icon_names() {
                 println!("{name}");
@@ -223,6 +246,8 @@ impl Runner {
                     .with_context(|| format!("cannot run {command:?}"))?;
                 self.children.push(child);
             }
+            Action::Keys(chord) => keys::send_chord(Chord::parse(chord)?)?,
+            Action::Text(text) => keys::type_text(text)?,
             Action::Page(_) => {
                 if let Some(to) = self.setup.target(self.page, action) {
                     if to != self.page {
@@ -243,9 +268,12 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 fn run(path: &Path) -> Result<()> {
     let stop = interrupted()?;
     let setup = Setup::load(path)?;
-    let api = HidApi::new()?;
-    let mut keypad = open(&api)?;
-    keypad.divert_page_buttons(true)?;
+    if setup.sends_keys() && !keys::trusted(true) {
+        eprintln!(
+            "keystroke keys need Accessibility: allow mx-keypad under System Settings → \
+             Privacy & Security → Accessibility; they fail until then"
+        );
+    }
     let mut runner = Runner {
         path: path.to_path_buf(),
         loaded: mtime(path),
@@ -253,16 +281,50 @@ fn run(path: &Path) -> Result<()> {
         page: 0,
         children: Vec::new(),
     };
+    let mut api = HidApi::new()?;
+    let mut waiting = false;
+    while !stop.load(Ordering::Relaxed) {
+        let Some(mut keypad) = Keypad::open(&api)? else {
+            if !waiting {
+                eprintln!("waiting for the MX Creative Keypad (USB)");
+                waiting = true;
+            }
+            for _ in 0..5 {
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                std::thread::sleep(TICK);
+            }
+            api.refresh_devices()?;
+            continue;
+        };
+        if waiting {
+            eprintln!("keypad connected");
+            waiting = false;
+        }
+        let served = session(&mut runner, &mut keypad, &stop);
+        // Blank the keys on the way out, whatever ended the session: images
+        // left behind would look live while nothing answers the presses.
+        let cleared = keypad.clear();
+        match served {
+            Ok(()) => return cleared,
+            // Unplugged, most likely: wait for it to come back.
+            Err(error) => eprintln!("{error:#}; reconnecting"),
+        }
+        drop(keypad);
+        api.refresh_devices()?;
+    }
+    Ok(())
+}
+
+/// Set up a freshly opened keypad and serve it until `stop` or an error.
+fn session(runner: &mut Runner, keypad: &mut Keypad, stop: &AtomicBool) -> Result<()> {
+    keypad.divert_page_buttons(true)?;
     if let Some(level) = runner.setup.brightness {
         keypad.set_brightness(level)?;
     }
-    runner.show(&mut keypad)?;
-
-    let served = serve(&mut runner, &mut keypad, &stop);
-    // Blank the keys on the way out, whatever ended the loop: images left
-    // behind would look live while nothing answers the presses.
-    let cleared = keypad.clear();
-    served.and(cleared)
+    runner.show(keypad)?;
+    serve(runner, keypad, stop)
 }
 
 /// Act on presses and config changes until `stop` is set.

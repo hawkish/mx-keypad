@@ -50,10 +50,19 @@ mx-keypad run --config examples/demo.json
 ```
 
 `run` shows the first page, executes actions on press, and checks for configuration changes. If a
-changed file fails validation, it reports the error and keeps the previous configuration. Both
-`run` and `events` take over the page buttons while active and attempt to return them to the
-firmware on exit, including Ctrl-C and SIGTERM. When `run` stops, it also blanks all nine keys, so an image
-left on the panel never looks like a live key.
+changed file fails validation, it reports the error and keeps the previous configuration. If the
+keypad isn't connected, or is unplugged while running, `run` waits and reconnects automatically
+instead of exiting. Both `run` and `events` take over the page buttons while active and attempt to
+return them to the firmware on exit, including Ctrl-C and SIGTERM. When `run` stops, it also blanks
+all nine keys, so an image left on the panel never looks like a live key.
+
+On macOS, run `mx-keypad install [--config path]` to install `run` as a per-user LaunchAgent: it
+starts at login, restarts if it stops, and logs to `~/Library/Logs/mx-keypad.log`. Running it as
+its own LaunchAgent means macOS asks Accessibility permission of mx-keypad itself, rather than of
+whatever terminal or tmux server launched it, which matters for the `keys` and `text` actions
+below. `mx-keypad uninstall` stops and removes the LaunchAgent. Installing from a Nix store path
+logs a warning, since that path stops existing after garbage collection; install from a stable
+path such as `~/.nix-profile/bin/mx-keypad` instead.
 
 Use the other commands to check a configuration, draw a tile, or inspect input:
 
@@ -109,7 +118,7 @@ This example uses one page and one key. Save it as a JSON file and pass its path
 | `pages[].keys.<key>.background` | Optional background color; overrides `defaults.background`. |
 | `pages[].keys.<key>.foreground` | Optional icon and label color; overrides `defaults.foreground`. PNG and JPEG icons keep their own colors. |
 | `pages[].keys.<key>.glyph_scale` | Optional icon size, from `0.05` to `1.0`; overrides `defaults.glyph_scale`. |
-| `pages[].keys.<key>.action` | Optional action: `"none"`, `{ "run": "command" }`, or `{ "page": "next" }`, `{ "page": "prev" }`, or `{ "page": "name" }`. Defaults to `"none"`. |
+| `pages[].keys.<key>.action` | Optional action: `"none"`, `{ "run": "command" }`, `{ "page": "next" }`, `{ "page": "prev" }`, `{ "page": "name" }`, `{ "keys": "chord" }`, or `{ "text": "string" }`. Defaults to `"none"`. |
 | `page_buttons.left` | Optional action for the left page button. Default: `{ "page": "prev" }`. |
 | `page_buttons.right` | Optional action for the right page button. Default: `{ "page": "next" }`. |
 
@@ -117,6 +126,27 @@ This example uses one page and one key. Save it as a JSON file and pass its path
 are reserved as navigation targets. Run actions must not be empty. They start through `sh -c`
 without blocking input, so only use configurations and commands you trust. Unknown configuration
 fields are rejected.
+
+### Keystroke actions (macOS)
+
+`{ "keys": "cmd+shift+4" }` presses a shortcut, and `{ "text": "hello" }` types a string, by
+posting the keystrokes directly. Both need **macOS** and are rejected when checked on another
+platform.
+
+A chord is modifier names and one key, joined by `+`, in any case: `cmd` (or `command`/`super`),
+`ctrl` (or `control`), `alt` (or `opt`/`option`), and `shift`, plus a letter, digit, function key
+(`f1`–`f12`), punctuation (`-`, `=`, `[`, `]`, `;`, `'`, `\`, `,`, `.`, `/`, `` ` ``, or their
+names such as `minus`), or a named key such as `return`, `tab`, `space`, `delete`, `escape`,
+`home`, `end`, `pageup`, `pagedown`, or an arrow (`left`, `right`, `up`, `down`). A literal plus is
+`plus`. Key codes are for the ANSI layout; typed text is sent as Unicode and doesn't depend on the
+keyboard layout.
+
+Because these actions post events on the keypad's behalf, macOS requires that mx-keypad itself be
+allowed under **System Settings → Privacy & Security → Accessibility**. If a configuration with a
+`keys` or `text` action isn't yet trusted, `run` shows the system permission prompt once per
+process and prints a reminder; the actions fail until permission is granted. Running through
+`mx-keypad install` (above) keeps that permission tied to mx-keypad rather than to a terminal or
+tmux server.
 
 ## Use the library
 
@@ -152,7 +182,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `Keypad::open` returns `Ok(None)` when no matching device is found. `Keypad` also provides
 `set_brightness`, `divert_page_buttons`, and `poll`; dropping it attempts to restore diverted page
-buttons.
+buttons. The `mx_keypad::keys` module (macOS only) posts shortcuts and typed text, and reports
+whether the process is trusted for Accessibility.
 
 ## Develop
 
