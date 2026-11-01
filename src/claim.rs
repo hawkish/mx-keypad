@@ -11,17 +11,22 @@ use std::process;
 
 use anyhow::{Context, Result};
 
-/// Where the claim file lives: `$XDG_STATE_HOME/mx-keypad/claim`, falling
-/// back to `~/.local/state/mx-keypad/claim`.
-fn claim_path() -> Result<PathBuf> {
+/// mx-keypad's state directory: `$XDG_STATE_HOME/mx-keypad`, falling back
+/// to `~/.local/state/mx-keypad`. The claim and the agent's socket live here.
+pub(crate) fn state_dir() -> Result<PathBuf> {
     if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
         let state_home = PathBuf::from(state_home);
         if state_home.is_absolute() {
-            return Ok(state_home.join("mx-keypad/claim"));
+            return Ok(state_home.join("mx-keypad"));
         }
     }
     let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".local/state/mx-keypad/claim"))
+    Ok(PathBuf::from(home).join(".local/state/mx-keypad"))
+}
+
+/// Where the claim file lives: `claim` in [`state_dir`].
+fn claim_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join("claim"))
 }
 
 /// Whether a process with this pid is alive. `kill(pid, 0)` sends no signal;
@@ -72,13 +77,13 @@ impl Claim {
     pub fn acquire(owner: &str) -> Result<Claim> {
         let path = claim_path()?;
         if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)
-                .with_context(|| format!("cannot create {}", dir.display()))?;
+            fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
         }
         let pid = process::id();
-        let mut file = fs::File::create(&path)
-            .with_context(|| format!("cannot create {}", path.display()))?;
-        writeln!(file, "{pid}\n{owner}").with_context(|| format!("cannot write {}", path.display()))?;
+        let mut file =
+            fs::File::create(&path).with_context(|| format!("cannot create {}", path.display()))?;
+        writeln!(file, "{pid}\n{owner}")
+            .with_context(|| format!("cannot write {}", path.display()))?;
         Ok(Claim { path, pid })
     }
 }

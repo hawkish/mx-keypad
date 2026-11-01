@@ -15,6 +15,7 @@ pub mod image;
 pub mod input;
 pub mod keys;
 pub mod press;
+pub mod remote;
 pub mod render;
 pub mod session;
 pub mod shift;

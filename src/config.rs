@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::render::{self, Face, IconSource, Rgb};
 
@@ -96,77 +96,78 @@ pub struct Page {
     pub keys: BTreeMap<String, Key>,
 }
 
-/// One key's face and action.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// One key's face and action. Serializes too, so a remote-page client can
+/// send keys in exactly this shape.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Key {
     /// Built-in icon name or image path.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     /// Text under the icon.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     /// Overrides [`Defaults::background`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<Rgb>,
     /// Overrides [`Defaults::foreground`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground: Option<Rgb>,
     /// Overrides [`Defaults::glyph_scale`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub glyph_scale: Option<f32>,
     /// What a press does.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Action::is_none")]
     pub action: Action,
     /// What holding the key past `defaults.long_press_ms` does instead. A
     /// key with one acts on release when tapped.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub long_press: Option<Action>,
     /// Make the key blink between its face and these colours.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blink: Option<Blink>,
     /// What the key shows and does while the keypad's shift is on; fields
     /// left out follow the key's own, shifted automatically.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shifted: Option<Shifted>,
 }
 
 /// A key's overrides while shift is on.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Shifted {
     /// Built-in icon name or image path.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     /// Text under the icon.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     /// Background colour.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<Rgb>,
     /// Icon and label colour.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground: Option<Rgb>,
     /// Icon size.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub glyph_scale: Option<f32>,
     /// What a press does.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<Action>,
     /// What a long press does.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub long_press: Option<Action>,
 }
 
 /// A blinking key's alternate colours and pace.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Blink {
     /// Background of the alternate face.
     #[serde(default = "black")]
     pub background: Rgb,
     /// Icon and label colour of the alternate face; the key's own when absent.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground: Option<Rgb>,
     /// How long each face shows.
     #[serde(default = "blink_ms")]
@@ -182,7 +183,7 @@ fn blink_ms() -> u64 {
 pub const BLINK_RANGE_MS: std::ops::RangeInclusive<u64> = 200..=10_000;
 
 /// What pressing a key does.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     /// Nothing.
@@ -252,6 +253,12 @@ pub const SYSTEM_ACTIONS: [&str; 3] = ["sleep", "display-sleep", "lock"];
 pub const MAX_DELAY_MS: u64 = 10_000;
 
 impl Action {
+    /// Whether this is `none`, the action of a key that does nothing.
+    #[must_use]
+    pub fn is_none(&self) -> bool {
+        matches!(self, Action::None)
+    }
+
     /// Whether the action posts input events, which needs Accessibility.
     #[must_use]
     pub fn sends_keys(&self) -> bool {
@@ -412,111 +419,13 @@ impl Setup {
         let defaults = &config.defaults;
         let mut pages = Vec::new();
         for (p, page) in config.pages.iter().enumerate() {
-            let mut keys: [(Face, Action); 9] = std::array::from_fn(|_| {
-                (
-                    Face {
-                        background: defaults.background,
-                        foreground: defaults.foreground,
-                        glyph_scale: defaults.glyph_scale,
-                        ..Face::default()
-                    },
-                    Action::None,
-                )
-            });
-            let mut long: [Option<Action>; 9] = Default::default();
-            let mut blink: [Option<BlinkSpec>; 9] = Default::default();
-            let mut shifted_keys = keys.clone();
-            let mut shifted_long: [Option<Action>; 9] = Default::default();
-            for (index, key) in &page.keys {
-                let at = format!("pages[{p}].keys.{index:?}");
-                let slot = index
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|n| (1..=9).contains(n))
-                    .with_context(|| format!("{at}: keys are \"1\" to \"9\""))?;
-                check_action(&key.action, &names, &format!("{at}.action"))?;
-                if matches!(key.action, Action::Shift(_)) && key.long_press.is_some() {
-                    bail!("{at}: a shift key cannot have long_press");
-                }
-                if let Some(long) = &key.long_press {
-                    if matches!(long, Action::Shift(_)) {
-                        bail!("{at}.long_press: shift only works as a key's action");
-                    }
-                    check_action(long, &names, &format!("{at}.long_press"))?;
-                    // Held actions need the release edge, which a key with
-                    // two actions spends on telling them apart.
-                    for (what, action) in [("action", &key.action), ("long_press", long)] {
-                        if action.is_held() {
-                            bail!(
-                                "{at}.{what}: hold and switch cannot share a key with long_press"
-                            );
-                        }
-                    }
-                }
-                let icon = key
-                    .icon
-                    .as_deref()
-                    .map(|icon| icon_source(icon, base))
-                    .transpose()
-                    .with_context(|| format!("{at}.icon"))?;
-                let glyph_scale = key.glyph_scale.unwrap_or(defaults.glyph_scale);
-                if !(0.05..=1.0).contains(&glyph_scale) {
-                    bail!("{at}.glyph_scale: {glyph_scale} is outside 0.05–1");
-                }
-                keys[slot - 1] = (
-                    Face {
-                        icon,
-                        label: key.label.clone(),
-                        background: key.background.unwrap_or(defaults.background),
-                        foreground: key.foreground.unwrap_or(defaults.foreground),
-                        glyph_scale,
-                    },
-                    key.action.clone(),
-                );
-                long[slot - 1].clone_from(&key.long_press);
-                if let Some(b) = &key.blink {
-                    if !BLINK_RANGE_MS.contains(&b.interval_ms) {
-                        bail!(
-                            "{at}.blink.interval_ms: {} is outside {}–{}",
-                            b.interval_ms,
-                            BLINK_RANGE_MS.start(),
-                            BLINK_RANGE_MS.end()
-                        );
-                    }
-                    blink[slot - 1] = Some(BlinkSpec {
-                        background: b.background,
-                        foreground: b.foreground,
-                        interval: std::time::Duration::from_millis(b.interval_ms),
-                    });
-                }
-                let (face, action) = shifted_binding(
-                    &keys[slot - 1],
-                    key.shifted.as_ref(),
-                    base,
-                    &names,
-                    &format!("{at}.shifted"),
-                )?;
-                shifted_keys[slot - 1] = (face, action);
-                shifted_long[slot - 1] =
-                    match key.shifted.as_ref().and_then(|s| s.long_press.clone()) {
-                        Some(long) => {
-                            if key.long_press.is_none() {
-                                bail!("{at}.shifted.long_press: the key has no long_press");
-                            }
-                            check_action(&long, &names, &format!("{at}.shifted.long_press"))?;
-                            Some(long)
-                        }
-                        None => key.long_press.as_ref().map(shifted_action),
-                    };
-            }
-            pages.push(ResolvedPage {
-                long,
-                blink,
-                shifted_keys,
-                shifted_long,
-                name: page.name.clone(),
-                keys,
-            });
+            pages.push(resolve_page(
+                page,
+                &format!("pages[{p}]."),
+                defaults,
+                &names,
+                base,
+            )?);
         }
         Ok(Setup {
             brightness: config.brightness,
@@ -541,6 +450,144 @@ impl Setup {
             name => self.pages.iter().position(|p| p.name == name)?,
         })
     }
+}
+
+/// Resolve a page a remote client sent: config keys with the default face
+/// settings. Its icons must be built-in names or absolute or `~/` paths,
+/// since a client's working directory means nothing to the agent, and its
+/// `page` actions can only be `next` or `prev`.
+pub fn resolve_remote_page(name: &str, keys: &BTreeMap<String, Key>) -> Result<ResolvedPage> {
+    for (index, key) in keys {
+        let icons = [
+            key.icon.as_deref(),
+            key.shifted.as_ref().and_then(|s| s.icon.as_deref()),
+        ];
+        for icon in icons.into_iter().flatten() {
+            let looks_like_path = icon.contains('/') || Path::new(icon).extension().is_some();
+            if looks_like_path && !Path::new(icon).is_absolute() && !icon.starts_with("~/") {
+                bail!("keys.{index:?}.icon: {icon:?} must be absolute or start with ~/");
+            }
+        }
+    }
+    let page = Page {
+        name: name.to_string(),
+        keys: keys.clone(),
+    };
+    resolve_page(&page, "", &Defaults::default(), &[], Path::new("/"))
+}
+
+/// Resolve one page: every key's face, action, long press, blink and shifted
+/// binding. `prefix` starts the error locations (`pages[0].`), `names` are
+/// the pages a `page` action may name, and icon paths resolve against `base`.
+fn resolve_page(
+    page: &Page,
+    prefix: &str,
+    defaults: &Defaults,
+    names: &[&str],
+    base: &Path,
+) -> Result<ResolvedPage> {
+    let mut keys: [(Face, Action); 9] = std::array::from_fn(|_| {
+        (
+            Face {
+                background: defaults.background,
+                foreground: defaults.foreground,
+                glyph_scale: defaults.glyph_scale,
+                ..Face::default()
+            },
+            Action::None,
+        )
+    });
+    let mut long: [Option<Action>; 9] = Default::default();
+    let mut blink: [Option<BlinkSpec>; 9] = Default::default();
+    let mut shifted_keys = keys.clone();
+    let mut shifted_long: [Option<Action>; 9] = Default::default();
+    for (index, key) in &page.keys {
+        let at = format!("{prefix}keys.{index:?}");
+        let slot = index
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=9).contains(n))
+            .with_context(|| format!("{at}: keys are \"1\" to \"9\""))?;
+        check_action(&key.action, names, &format!("{at}.action"))?;
+        if matches!(key.action, Action::Shift(_)) && key.long_press.is_some() {
+            bail!("{at}: a shift key cannot have long_press");
+        }
+        if let Some(long) = &key.long_press {
+            if matches!(long, Action::Shift(_)) {
+                bail!("{at}.long_press: shift only works as a key's action");
+            }
+            check_action(long, names, &format!("{at}.long_press"))?;
+            // Held actions need the release edge, which a key with
+            // two actions spends on telling them apart.
+            for (what, action) in [("action", &key.action), ("long_press", long)] {
+                if action.is_held() {
+                    bail!("{at}.{what}: hold and switch cannot share a key with long_press");
+                }
+            }
+        }
+        let icon = key
+            .icon
+            .as_deref()
+            .map(|icon| icon_source(icon, base))
+            .transpose()
+            .with_context(|| format!("{at}.icon"))?;
+        let glyph_scale = key.glyph_scale.unwrap_or(defaults.glyph_scale);
+        if !(0.05..=1.0).contains(&glyph_scale) {
+            bail!("{at}.glyph_scale: {glyph_scale} is outside 0.05–1");
+        }
+        keys[slot - 1] = (
+            Face {
+                icon,
+                label: key.label.clone(),
+                background: key.background.unwrap_or(defaults.background),
+                foreground: key.foreground.unwrap_or(defaults.foreground),
+                glyph_scale,
+            },
+            key.action.clone(),
+        );
+        long[slot - 1].clone_from(&key.long_press);
+        if let Some(b) = &key.blink {
+            if !BLINK_RANGE_MS.contains(&b.interval_ms) {
+                bail!(
+                    "{at}.blink.interval_ms: {} is outside {}–{}",
+                    b.interval_ms,
+                    BLINK_RANGE_MS.start(),
+                    BLINK_RANGE_MS.end()
+                );
+            }
+            blink[slot - 1] = Some(BlinkSpec {
+                background: b.background,
+                foreground: b.foreground,
+                interval: std::time::Duration::from_millis(b.interval_ms),
+            });
+        }
+        let (face, action) = shifted_binding(
+            &keys[slot - 1],
+            key.shifted.as_ref(),
+            base,
+            names,
+            &format!("{at}.shifted"),
+        )?;
+        shifted_keys[slot - 1] = (face, action);
+        shifted_long[slot - 1] = match key.shifted.as_ref().and_then(|s| s.long_press.clone()) {
+            Some(long) => {
+                if key.long_press.is_none() {
+                    bail!("{at}.shifted.long_press: the key has no long_press");
+                }
+                check_action(&long, names, &format!("{at}.shifted.long_press"))?;
+                Some(long)
+            }
+            None => key.long_press.as_ref().map(shifted_action),
+        };
+    }
+    Ok(ResolvedPage {
+        long,
+        blink,
+        shifted_keys,
+        shifted_long,
+        name: page.name.clone(),
+        keys,
+    })
 }
 
 /// A key's face and action while shift is on: its overrides, else its own

@@ -49,6 +49,12 @@ impl Rgb {
     }
 }
 
+impl serde::Serialize for Rgb {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.hex())
+    }
+}
+
 /// An embedded icon name or a path to an SVG, PNG, or JPEG.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IconSource {

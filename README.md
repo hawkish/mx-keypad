@@ -3,9 +3,8 @@
 Control the Logitech MX Creative Keypad over USB with a JSON configuration. Set images and actions
 for its nine 118 × 118 LCD keys, assign the two page buttons, and adjust panel brightness.
 
-The Rust library exposes the same device operations without an async runtime, including a claim
-mechanism so another program, such as tmux-legion's sidebar, can borrow the keypad and hand it
-back. See [Hand the keypad to another program](#hand-the-keypad-to-another-program).
+The Rust library exposes the same device operations without an async runtime. Other programs can
+add [remote pages](#remote-pages) while the agent keeps running your configured actions.
 
 ## Install and check a configuration
 
@@ -67,6 +66,9 @@ keys.
 retried before reconnecting. On macOS, `run` empties the agent log at startup if it's over 1 MiB.
 
 ## Hand the keypad to another program
+
+The claim mechanism is deprecated in v0.7.0. Use [remote pages](#remote-pages) for new integrations;
+claims remain available for older clients.
 
 macOS `hidapi` opens the keypad exclusively, so `run` can share it with another program, such as
 tmux-legion's sidebar, by taking turns instead of at the same time. The other program takes a
@@ -355,6 +357,83 @@ fn demo() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+## Remote pages
+
+Publish a page from another program while `mx-keypad run` owns the device. The page's keys use
+the config's own key format, and the agent runs their actions itself, so the other program never
+needs Accessibility. Keys without an action are sent back to that program as presses instead. Connect to `$XDG_STATE_HOME/mx-keypad/agent.sock`, or
+`~/.local/state/mx-keypad/agent.sock` when `XDG_STATE_HOME` isn't an absolute path. The socket has
+mode `0600` and stays available while the keypad is unplugged or a legacy claim is active.
+
+Protocol v1 uses newline-delimited JSON. Send `hello` first and wait for `welcome`.
+
+| Direction | Message | Meaning |
+|---|---|---|
+| Client → agent | `{"hello":{"client":"my-app","protocol":1}}` | Start the connection. An invalid handshake gets an error and closes. |
+| Agent → client | `{"welcome":{"protocol":1,"version":"0.7.0"}}` | Handshake accepted. |
+| Client → agent | `{"page":{"name":"agents","keys":{"1":{"label":"Ready"}},"show":false}}` | Add or replace an owned page. Omitted keys are blank; `show` defaults to false. |
+| Client → agent | `{"keys":{"page":"agents","keys":{"3":{"icon":"bell"}}}}` | Replace the specified keys. |
+| Client → agent | `{"show":"agents"}` | Turn to an owned page. |
+| Client → agent | `{"remove":"agents"}` | Remove an owned page. |
+| Agent → client | `{"down":{"page":"agents","key":3}}` / `{"up":{"page":"agents","key":3}}` | Press or release of a grid key, numbered 1–9, that has no action or long press. |
+| Agent → client | `{"error":{"message":"…"}}` | Refused request. After the handshake, the connection stays open. |
+
+Each key is written exactly as in a config page: `icon`, `label`, `background`, `foreground`,
+`glyph_scale`, `action`, `long_press`, `shifted`, and `blink`, with the default `defaults`. For
+example, `{"label":"Esc","action":{"keys":"escape"}}` is a key the agent presses Escape for. Icons
+must be built-in names or absolute or `~/` paths, and `page` actions can only be `next` or `prev`.
+The agent checks a whole request before applying any of it.
+
+While any client has a page, the clients' pages replace the config's: the keypad turns to the
+first one, and page-turn actions go through the client pages only, in the order they were added.
+The config's pages come back when the last client page goes. The agent takes over the page buttons
+whenever a remote page exists. Names share one namespace:
+a client can replace its own page but can't take another client's or a config page's name.
+Disconnecting removes that client's pages. Removing the visible page shows the first client page left,
+or the first config page when none is; removing another page keeps the current one. Config reloads preserve remote pages and the
+current page by name. A reload that collides with a remote name keeps the previous config.
+
+A release goes to the page that received its press, even after a page turn. Shift, long press and
+blink work on remote pages as on config pages, and the keypad's shift is shared by every page.
+A client that reconnects within a minute and adds its page again gets it back on screen, if that
+page was showing and no page was turned in between.
+
+With the `mx-keypad` dependency above, publish a page and handle its presses in Rust:
+
+```rust
+use mx_keypad::config::{Action, Key};
+use mx_keypad::remote::Client;
+use mx_keypad::{Button, Event};
+use std::time::Duration;
+
+fn main() {
+    let mut client = Client::new("my-app");
+    let mut keys: [Key; 9] = std::array::from_fn(|_| Key::default());
+    keys[0].label = Some("Ready".into()); // no action: presses come back here
+    keys[1].label = Some("Esc".into());
+    keys[1].action = Action::Keys("escape".into()); // the agent presses it
+    client.set_page("agents", keys);
+
+    loop {
+        for (page, event) in client.poll() {
+            if let Event::Down(Button::Key(key)) = event {
+                println!("{page}: key {key}");
+            }
+        }
+        for error in client.take_errors() {
+            eprintln!("{error}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+```
+
+Call `poll()` each frame: it doesn't block, and connection handshakes run on a worker thread.
+The client reconnects with a 1-second backoff, doubling to 30 seconds, and resends its desired
+pages in insertion order. Repeated `set_page` calls send only changed keys. Use `show(name)` after
+`connected()` becomes true to turn to a page, or `remove(name)` to stop publishing it.
+Read connection and protocol errors with `take_errors()`.
 
 ## Develop
 

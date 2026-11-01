@@ -1,9 +1,12 @@
 //! A running [`Setup`](crate::config::Setup): what each key shows and does
 //! right now, held keys, shift, long press, blink, and the child processes a
 //! `run` or `open` action started. This is the engine behind `mx-keypad
-//! run`, exposed so another program sharing this crate's [`Keypad`] — such
-//! as tmux-legion, running its own page alongside an agent-status one —
-//! can run the same kind of config without reimplementing action dispatch.
+//! run`, exposed so a program driving its own [`Keypad`] can run the same
+//! kind of config without reimplementing action dispatch.
+//!
+//! It also holds *remote pages*: pages another program adds over the agent's
+//! socket ([`crate::remote`]), drawn after the config's pages, whose presses
+//! are queued for that program instead of acted on here.
 //!
 //! A `Session` never touches a [`Keypad`] or a terminal: it decides what to
 //! draw ([`Session::face`]) and performs an action's side effects
@@ -15,15 +18,31 @@ use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::blink;
-use crate::config::{Action, Setup};
+use crate::config::{Action, ResolvedPage, Setup};
 use crate::keys::{self, Chord};
 use crate::press::{Fire, LongPress};
+use crate::remote::ConnId;
 use crate::render::Face;
 use crate::shift::{self, Shift};
-use crate::Button;
+use crate::{Button, Event};
+
+/// A page a socket client added, resolved like a config page, and which
+/// connection owns it.
+struct RemotePage {
+    owner: ConnId,
+    page: ResolvedPage,
+}
+
+/// A press to forward to the connection that owns a remote page.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RemoteEvent {
+    pub owner: ConnId,
+    pub page: String,
+    pub event: Event,
+}
 
 /// A running setup: current page, held keys, shift, long press, blink epoch,
 /// and the `run`/`open` children still alive.
@@ -35,7 +54,22 @@ pub struct Session {
     blink_epoch: Instant,
     shift: Shift<Button>,
     children: Vec<Child>,
+    /// Client pages, in the order they were added.
+    remote: Vec<RemotePage>,
+    /// Grid keys that went down on a remote page, and which one, so the
+    /// release goes there too.
+    remote_held: HashMap<Button, (ConnId, String)>,
+    /// Presses on remote pages, waiting for the caller to forward them.
+    remote_events: Vec<RemoteEvent>,
+    /// The remote page that was on screen when its client went away, and
+    /// when: a client that reconnects soon and adds it again gets it back on
+    /// screen, unless someone turned pages in between.
+    returning: Option<(String, Instant)>,
 }
+
+/// How long after a client drops its visible page that page still returns
+/// to the screen when added again — long enough for a reconnect's backoff.
+const RETURN_WINDOW: Duration = Duration::from_secs(60);
 
 impl Session {
     /// Start a session on `setup`'s first page.
@@ -50,17 +84,170 @@ impl Session {
             blink_epoch: Instant::now(),
             shift: Shift::default(),
             children: Vec::new(),
+            remote: Vec::new(),
+            remote_held: HashMap::new(),
+            remote_events: Vec::new(),
+            returning: None,
         }
     }
 
     /// Replace the setup — after a config file reload, say — trying to stay
     /// on a page of the same name rather than jumping back to the first.
-    /// Held keys and shift are left as they are.
+    /// Held keys and shift are left as they are. A config that takes a remote
+    /// page's name is ignored; call [`Session::check_reload`] for the error.
     pub fn reload(&mut self, setup: Setup) {
-        let name = self.setup.pages[self.page].name.clone();
-        self.page = setup.pages.iter().position(|p| p.name == name).unwrap_or(0);
+        if self.check_reload(&setup).is_err() {
+            return;
+        }
+        let name = self.page_name().to_owned();
         self.long.set_threshold(setup.long_press);
         self.setup = setup;
+        self.page = self.page_index(&name).unwrap_or(self.visible().start);
+    }
+
+    /// Reject a config reload that would collide with a connected client's page.
+    pub fn check_reload(&self, setup: &Setup) -> Result<()> {
+        for page in &setup.pages {
+            if self.remote.iter().any(|p| p.page.name == page.name) {
+                bail!("page {:?} belongs to a remote client", page.name);
+            }
+        }
+        Ok(())
+    }
+
+    /// The current page's name, for either kind of page.
+    pub fn page_name(&self) -> &str {
+        &self.current().name
+    }
+
+    /// The pages the page buttons go through: the clients' pages while any
+    /// client has one — they stand in for the config's, which come back when
+    /// the last client page goes — and the config's otherwise.
+    fn visible(&self) -> std::ops::Range<usize> {
+        let local = self.setup.pages.len();
+        if self.remote.is_empty() {
+            0..local
+        } else {
+            local..local + self.remote.len()
+        }
+    }
+
+    /// The page on screen: a config page, or a client's after them.
+    fn current(&self) -> &ResolvedPage {
+        match self.setup.pages.get(self.page) {
+            Some(page) => page,
+            None => &self.remote[self.page - self.setup.pages.len()].page,
+        }
+    }
+
+    /// The client owning the page on screen, if it is a client's.
+    fn current_owner(&self) -> Option<ConnId> {
+        let at = self.page.checked_sub(self.setup.pages.len())?;
+        self.remote.get(at).map(|p| p.owner)
+    }
+
+    fn page_index(&self, name: &str) -> Option<usize> {
+        self.setup
+            .pages
+            .iter()
+            .map(|p| p.name.as_str())
+            .chain(self.remote.iter().map(|p| p.page.name.as_str()))
+            .position(|n| n == name)
+    }
+
+    /// Append a client's page, or replace one owned by the same connection.
+    pub fn add_remote(&mut self, owner: ConnId, page: ResolvedPage) -> Result<()> {
+        let name = page.name.clone();
+        if self.setup.pages.iter().any(|p| p.name == name) {
+            bail!("page {name:?} belongs to the config");
+        }
+        if let Some(existing) = self.remote.iter_mut().find(|p| p.page.name == name) {
+            if existing.owner != owner {
+                bail!("page {name:?} belongs to another client");
+            }
+            existing.page = page;
+        } else {
+            // The first client page replaces the config's pages on screen.
+            let first = self.remote.is_empty();
+            self.remote.push(RemotePage { owner, page });
+            if first {
+                self.page = self.setup.pages.len();
+            }
+            if let Some((returning, at)) = self.returning.take() {
+                if returning == name && at.elapsed() < RETURN_WINDOW {
+                    self.page = self.setup.pages.len() + self.remote.len() - 1;
+                } else {
+                    self.returning = Some((returning, at));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn owned_index(&self, owner: ConnId, name: &str) -> Result<usize> {
+        self.remote
+            .iter()
+            .position(|p| p.owner == owner && p.page.name == name)
+            .with_context(|| format!("no owned page named {name:?}"))
+    }
+
+    /// Copy keys `slots` (0–8) from `from` onto the owned page of the same
+    /// name, leaving its other keys as they are.
+    pub fn update_remote(
+        &mut self,
+        owner: ConnId,
+        from: &ResolvedPage,
+        slots: &[usize],
+    ) -> Result<()> {
+        let at = self.owned_index(owner, &from.name)?;
+        let page = &mut self.remote[at].page;
+        for &i in slots {
+            if i >= 9 {
+                bail!("key index must be 0–8");
+            }
+            page.keys[i] = from.keys[i].clone();
+            page.long[i].clone_from(&from.long[i]);
+            page.blink[i].clone_from(&from.blink[i]);
+            page.shifted_keys[i] = from.shifted_keys[i].clone();
+            page.shifted_long[i].clone_from(&from.shifted_long[i]);
+        }
+        Ok(())
+    }
+
+    /// Turn to an owned remote page.
+    pub fn show_remote(&mut self, owner: ConnId, name: &str) -> Result<()> {
+        self.page = self.setup.pages.len() + self.owned_index(owner, name)?;
+        Ok(())
+    }
+
+    /// Remove an owned page, returning to page zero if it was visible.
+    pub fn remove_remote(&mut self, owner: ConnId, name: &str) -> Result<()> {
+        let at = self.owned_index(owner, name)?;
+        let current = self.page_name().to_owned();
+        self.remote.remove(at);
+        self.page = self.page_index(&current).unwrap_or(self.visible().start);
+        Ok(())
+    }
+
+    /// Remove all pages belonging to a disconnected client.
+    pub fn drop_owner(&mut self, owner: ConnId) {
+        let current = self.page_name().to_owned();
+        if self
+            .remote
+            .iter()
+            .any(|p| p.owner == owner && p.page.name == current)
+        {
+            self.returning = Some((current.clone(), Instant::now()));
+        }
+        self.remote.retain(|p| p.owner != owner);
+        self.remote_held.retain(|_, (id, _)| *id != owner);
+        self.remote_events.retain(|e| e.owner != owner);
+        self.page = self.page_index(&current).unwrap_or(self.visible().start);
+    }
+
+    /// Drain the remote press/release events awaiting forwarding.
+    pub fn take_remote_events(&mut self) -> Vec<RemoteEvent> {
+        std::mem::take(&mut self.remote_events)
     }
 
     /// The setup currently running.
@@ -74,7 +261,7 @@ impl Session {
     /// shift is active.
     #[must_use]
     pub fn face(&self, i: usize, now: Instant) -> Face {
-        let page = &self.setup.pages[self.page];
+        let page = self.current();
         let face = if self.shift.active() {
             &page.shifted_keys[i].0
         } else {
@@ -91,7 +278,7 @@ impl Session {
     /// When the next blinking key on the current page flips, if any blinks.
     #[must_use]
     pub fn next_flip(&self, now: Instant) -> Option<Instant> {
-        self.setup.pages[self.page]
+        self.current()
             .blink
             .iter()
             .flatten()
@@ -111,7 +298,7 @@ impl Session {
     /// they should keep their firmware behaviour.
     #[must_use]
     pub fn needs_page_buttons(&self) -> bool {
-        self.setup.needs_page_buttons()
+        !self.remote.is_empty() || self.setup.needs_page_buttons()
     }
 
     /// The configured panel brightness, if the config sets one. Apply this
@@ -123,10 +310,27 @@ impl Session {
     }
 
     /// `button` went down: act now, or start timing it when it has a
-    /// long-press action.
+    /// long-press action. A grid key on a client's page with neither is
+    /// queued for that client instead (see [`Session::take_remote_events`]).
     pub fn down(&mut self, button: Button) -> Result<()> {
+        if self.remote_held.contains_key(&button) {
+            return Ok(());
+        }
         let action = self.action(button);
-        match self.long_action(button) {
+        let long = self.long_action(button);
+        if let (Some(owner), Button::Key(_), Action::None, None) =
+            (self.current_owner(), button, &action, &long)
+        {
+            let page = self.page_name().to_owned();
+            self.remote_held.insert(button, (owner, page.clone()));
+            self.remote_events.push(RemoteEvent {
+                owner,
+                page,
+                event: Event::Down(button),
+            });
+            return Ok(());
+        }
+        match long {
             Some(long) => {
                 self.long.down(button, Instant::now(), action, long);
                 Ok(())
@@ -137,8 +341,15 @@ impl Session {
 
     /// `button` came up: decide a timed press, and let go of anything held.
     pub fn up(&mut self, button: Button) -> Result<()> {
-        if let Some(Fire::Short(action) | Fire::Long(action)) =
-            self.long.up(button, Instant::now())
+        if let Some((owner, page)) = self.remote_held.remove(&button) {
+            self.remote_events.push(RemoteEvent {
+                owner,
+                page,
+                event: Event::Up(button),
+            });
+            return Ok(());
+        }
+        if let Some(Fire::Short(action) | Fire::Long(action)) = self.long.up(button, Instant::now())
         {
             self.press(button, &action)?;
         }
@@ -168,6 +379,13 @@ impl Session {
 
     /// Let go of everything held, when the session ends.
     pub fn release_all(&mut self) {
+        for (button, (owner, page)) in self.remote_held.drain() {
+            self.remote_events.push(RemoteEvent {
+                owner,
+                page,
+                event: Event::Up(button),
+            });
+        }
         self.long.clear();
         self.shift.clear();
         for (_, held) in self.held.drain() {
@@ -179,7 +397,7 @@ impl Session {
     fn long_action(&self, button: Button) -> Option<Action> {
         match button {
             Button::Key(n) => {
-                let page = &self.setup.pages[self.page];
+                let page = self.current();
                 let long = if self.shift.active() {
                     &page.shifted_long
                 } else {
@@ -195,7 +413,7 @@ impl Session {
     fn action(&self, button: Button) -> Action {
         match button {
             Button::Key(n) => {
-                let page = &self.setup.pages[self.page];
+                let page = self.current();
                 let keys = if self.shift.active() {
                     &page.shifted_keys
                 } else {
@@ -226,8 +444,17 @@ impl Session {
     /// Do what `action` says, for `button`.
     fn perform_action(&mut self, button: Button, action: &Action) -> Result<()> {
         match action {
-            Action::Page(_) => {
-                if let Some(to) = self.setup.target(self.page, action) {
+            Action::Page(name) => {
+                self.returning = None;
+                let visible = self.visible();
+                let count = visible.len();
+                let at = self.page.saturating_sub(visible.start) % count;
+                let to = match name.as_str() {
+                    "next" => Some(visible.start + (at + 1) % count),
+                    "prev" => Some(visible.start + (at + count - 1) % count),
+                    name => self.page_index(name),
+                };
+                if let Some(to) = to {
                     self.page = to;
                 }
             }
@@ -334,10 +561,7 @@ fn prepare(action: &Action) -> Result<Step> {
 fn open_args(target: &str) -> Vec<String> {
     let target = target.trim();
     let expanded = match (target.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => std::path::Path::new(&home)
-            .join(rest)
-            .display()
-            .to_string(),
+        (Some(rest), Some(home)) => std::path::Path::new(&home).join(rest).display().to_string(),
         _ => target.to_string(),
     };
     let is_location = target.contains("://")
@@ -468,5 +692,176 @@ mod tests {
         assert_eq!(fired.len(), 1);
         assert_eq!(s.setup().pages[s.page].name, "c");
         s.up(Button::Key(1)).unwrap();
+    }
+
+    /// A client page called `name` with `keys` in config JSON.
+    fn remote(name: &str, keys: &str) -> ResolvedPage {
+        let keys = serde_json::from_str(keys).unwrap();
+        crate::config::resolve_remote_page(name, &keys).unwrap()
+    }
+
+    fn blank(name: &str) -> ResolvedPage {
+        remote(name, "{}")
+    }
+
+    #[test]
+    fn remote_pages_cycle_in_insertion_order_and_keep_the_current_name_on_removal() {
+        let mut s = session(r#"{"pages":[{"name":"a"}]}"#);
+        assert!(!s.needs_page_buttons());
+        s.add_remote(1, blank("z")).unwrap();
+        // The first client page replaces the config's on screen.
+        assert_eq!(s.page_name(), "z");
+        s.add_remote(2, blank("b")).unwrap();
+        assert_eq!(s.page_name(), "z");
+        assert!(s.needs_page_buttons());
+        for name in ["b", "z", "b"] {
+            s.down(Button::PageRight).unwrap();
+            assert_eq!(s.page_name(), name);
+        }
+        s.remove_remote(1, "z").unwrap();
+        assert_eq!(s.page_name(), "b");
+        s.down(Button::PageLeft).unwrap();
+        assert_eq!(s.page_name(), "b");
+        s.add_remote(1, blank("z")).unwrap();
+        s.show_remote(1, "z").unwrap();
+        s.remove_remote(1, "z").unwrap();
+        // The page on screen went: the first client page left shows.
+        assert_eq!(s.page_name(), "b");
+        s.drop_owner(2);
+        // The config's pages come back with the last client page gone.
+        assert_eq!(s.page_name(), "a");
+        assert!(!s.needs_page_buttons());
+    }
+
+    #[test]
+    fn remote_up_follows_down_across_page_turns_and_removal() {
+        let mut s = session(r#"{"pages":[{"name":"a"}]}"#);
+        s.add_remote(7, blank("agents")).unwrap();
+        s.show_remote(7, "agents").unwrap();
+        s.down(Button::Key(3)).unwrap();
+        s.down(Button::Key(3)).unwrap(); // repeated down is not another press
+        s.remove_remote(7, "agents").unwrap();
+        s.up(Button::Key(3)).unwrap();
+        assert_eq!(
+            s.take_remote_events(),
+            vec![
+                RemoteEvent {
+                    owner: 7,
+                    page: "agents".into(),
+                    event: Event::Down(Button::Key(3))
+                },
+                RemoteEvent {
+                    owner: 7,
+                    page: "agents".into(),
+                    event: Event::Up(Button::Key(3))
+                },
+            ]
+        );
+        s.add_remote(7, blank("agents")).unwrap();
+        s.show_remote(7, "agents").unwrap();
+        s.down(Button::Key(1)).unwrap();
+        s.take_remote_events();
+        s.down(Button::PageLeft).unwrap();
+        s.release_all();
+        assert_eq!(s.take_remote_events()[0].event, Event::Up(Button::Key(1)));
+    }
+
+    #[test]
+    fn a_client_page_runs_its_actions_here_and_forwards_only_keys_without_one() {
+        let mut s = session(r#"{"pages":[{"name":"a"}]}"#);
+        s.add_remote(
+            1,
+            remote(
+                "keys",
+                r#"{"1":{"action":{"page":"next"}},"2":{"label":"agent"},"8":{"action":{"shift":"hold"}}}"#,
+            ),
+        )
+        .unwrap();
+        s.show_remote(1, "keys").unwrap();
+        s.down(Button::Key(2)).unwrap();
+        s.up(Button::Key(2)).unwrap();
+        assert_eq!(s.take_remote_events().len(), 2);
+
+        // Shift, from a key on the client's own page, applies to that page.
+        s.down(Button::Key(8)).unwrap();
+        assert!(s.shift.active());
+        s.up(Button::Key(8)).unwrap();
+        assert!(s.take_remote_events().is_empty());
+
+        // A page action runs here, turning between the client's pages.
+        s.add_remote(1, blank("agents")).unwrap();
+        s.down(Button::Key(1)).unwrap();
+        assert!(s.take_remote_events().is_empty());
+        assert_eq!(s.page_name(), "agents");
+    }
+
+    #[test]
+    fn a_client_page_may_only_name_next_or_prev() {
+        let keys = serde_json::from_str(r#"{"1":{"action":{"page":"a"}}}"#).unwrap();
+        assert!(crate::config::resolve_remote_page("keys", &keys).is_err());
+        let keys = serde_json::from_str(r#"{"1":{"icon":"icons/x.svg"}}"#).unwrap();
+        assert!(crate::config::resolve_remote_page("keys", &keys).is_err());
+    }
+
+    #[test]
+    fn update_remote_replaces_only_the_named_keys() {
+        let mut s = session(r#"{"pages":[{"name":"a"}]}"#);
+        s.add_remote(
+            1,
+            remote("r", r#"{"1":{"label":"one"},"2":{"label":"two"}}"#),
+        )
+        .unwrap();
+        s.show_remote(1, "r").unwrap();
+        s.update_remote(1, &remote("r", r#"{"2":{"label":"TWO"}}"#), &[1])
+            .unwrap();
+        let now = Instant::now();
+        assert_eq!(s.face(0, now).label.as_deref(), Some("one"));
+        assert_eq!(s.face(1, now).label.as_deref(), Some("TWO"));
+        assert!(s.update_remote(2, &blank("r"), &[0]).is_err());
+        assert!(s.update_remote(1, &blank("r"), &[9]).is_err());
+    }
+
+    #[test]
+    fn remote_names_and_operations_are_owned_and_reload_preserves_pages() {
+        let mut s = session(r#"{"pages":[{"name":"a"}]}"#);
+        assert!(s.add_remote(1, blank("a")).is_err());
+        s.add_remote(1, blank("remote")).unwrap();
+        assert!(s.add_remote(2, blank("remote")).is_err());
+        assert!(s.show_remote(2, "remote").is_err());
+        assert!(s.remove_remote(2, "remote").is_err());
+        s.add_remote(1, remote("remote", r#"{"5":{"label":"updated"}}"#))
+            .unwrap();
+        s.show_remote(1, "remote").unwrap();
+        let setup = session(r#"{"pages":[{"name":"z"},{"name":"a"}]}"#).setup;
+        s.reload(setup);
+        assert_eq!(s.page_name(), "remote");
+        assert_eq!(s.face(4, Instant::now()).label.as_deref(), Some("updated"));
+        let collision = session(r#"{"pages":[{"name":"remote"}]}"#).setup;
+        assert!(s.check_reload(&collision).is_err());
+        s.reload(collision);
+        assert_eq!(s.setup.pages[0].name, "z");
+        s.drop_owner(1);
+        assert_eq!(s.page_name(), "z");
+    }
+
+    #[test]
+    fn a_reconnecting_client_gets_its_visible_page_back() {
+        let mut s = session(r#"{"pages":[{"name":"a"}]}"#);
+        s.add_remote(1, blank("keys")).unwrap();
+        s.add_remote(1, blank("agents")).unwrap();
+        s.show_remote(1, "agents").unwrap();
+        s.drop_owner(1);
+        assert_eq!(s.page_name(), "a");
+        s.add_remote(2, blank("keys")).unwrap();
+        s.add_remote(2, blank("agents")).unwrap();
+        assert_eq!(s.page_name(), "agents");
+
+        // Turning pages in between means the user has moved on: the
+        // client's first page shows, as for any client arriving.
+        s.drop_owner(2);
+        s.down(Button::PageRight).unwrap();
+        s.add_remote(3, blank("keys")).unwrap();
+        s.add_remote(3, blank("agents")).unwrap();
+        assert_eq!(s.page_name(), "keys");
     }
 }

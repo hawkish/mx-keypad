@@ -14,6 +14,7 @@ use mx_keypad::claim;
 use mx_keypad::config::{self, Setup};
 use mx_keypad::geometry::DISPLAY;
 use mx_keypad::keys::{self, Chord};
+use mx_keypad::remote::{self, Incoming, Reply, Server};
 use mx_keypad::render::{self, Face, Rgb};
 use mx_keypad::session::Session;
 use mx_keypad::{Event, KeyImageJpeg, Keypad};
@@ -275,35 +276,99 @@ fn show(
 }
 
 /// Take the page buttons over only when the setup uses them.
-fn follow_page_buttons(session: &Session, keypad: &mut Keypad) -> Result<()> {
-    keypad.divert_page_buttons(session.needs_page_buttons())
+fn follow_page_buttons(session: &Session, keypad: &mut Keypad, state: &mut RunState) -> Result<()> {
+    let divert = session.needs_page_buttons();
+    if state.diverted != Some(divert) {
+        keypad.divert_page_buttons(divert)?;
+        state.diverted = Some(divert);
+    }
+    Ok(())
+}
+
+struct RunState {
+    path: PathBuf,
+    loaded: Option<SystemTime>,
+    tiles: HashMap<String, KeyImageJpeg>,
+    server: Option<Server>,
+    diverted: Option<bool>,
+}
+
+impl RunState {
+    fn drain(&mut self, session: &mut Session) -> bool {
+        let Some(server) = &mut self.server else {
+            return false;
+        };
+        let incoming = server.drain();
+        let changed = !incoming.is_empty();
+        for message in incoming {
+            match message {
+                Incoming::Request(id, request) => {
+                    if let Err(error) = remote::apply(session, id, request) {
+                        server.send(
+                            id,
+                            &Reply::Error {
+                                message: format!("{error:#}"),
+                            },
+                        );
+                    }
+                }
+                Incoming::Gone(id) => session.drop_owner(id),
+            }
+        }
+        self.forward(session);
+        changed
+    }
+
+    fn forward(&mut self, session: &mut Session) {
+        for event in session.take_remote_events() {
+            let reply = match event.event {
+                Event::Down(mx_keypad::Button::Key(key)) => Reply::Down {
+                    page: event.page,
+                    key,
+                },
+                Event::Up(mx_keypad::Button::Key(key)) => Reply::Up {
+                    page: event.page,
+                    key,
+                },
+                _ => continue,
+            };
+            if let Some(server) = &mut self.server {
+                server.send(event.owner, &reply);
+            }
+        }
+    }
+
+    fn tick(&self) -> Duration {
+        if self.server.as_ref().is_some_and(Server::has_clients) {
+            Duration::from_millis(50)
+        } else {
+            TICK
+        }
+    }
 }
 
 /// Reload when the file changed; keep the old setup if the new one is
 /// broken, so a half-saved edit does not blank the keypad.
-fn reload(
-    session: &mut Session,
-    path: &Path,
-    loaded: &mut Option<SystemTime>,
-    keypad: &mut Keypad,
-    tiles: &mut HashMap<String, KeyImageJpeg>,
-) -> Result<()> {
-    let modified = mtime(path);
-    if modified == *loaded {
+fn reload(session: &mut Session, keypad: &mut Keypad, state: &mut RunState) -> Result<()> {
+    let modified = mtime(&state.path);
+    if modified == state.loaded {
         return Ok(());
     }
-    *loaded = modified;
-    match Setup::load(path) {
+    state.loaded = modified;
+    match Setup::load(&state.path).and_then(|setup| {
+        session.check_reload(&setup)?;
+        Ok(setup)
+    }) {
         Ok(setup) => {
             session.reload(setup);
             // Image files may have changed along with the config.
-            tiles.clear();
-            follow_page_buttons(session, keypad)?;
+            state.tiles.clear();
+            follow_page_buttons(session, keypad, state)?;
             if let Some(level) = session.brightness() {
                 keypad.set_brightness(level)?;
             }
-            log!("reloaded {}", path.display());
-            show(session, keypad, tiles)
+            log!("reloaded {}", state.path.display());
+            show(session, keypad, &mut state.tiles)
         }
         Err(error) => {
             log!("{error:#}; keeping the previous setup");
@@ -328,17 +393,30 @@ fn run(path: &Path) -> Result<()> {
         );
     }
     let mut session = Session::new(setup);
-    let mut loaded = mtime(path);
-    let mut tiles: HashMap<String, KeyImageJpeg> = HashMap::new();
+    let server = match remote::socket_path().and_then(Server::bind) {
+        Ok(server) => Some(server),
+        Err(error) => {
+            log!("remote pages unavailable: {error:#}");
+            None
+        }
+    };
+    let mut state = RunState {
+        path: path.to_path_buf(),
+        loaded: mtime(path),
+        tiles: HashMap::new(),
+        server,
+        diverted: None,
+    };
     let mut api = HidApi::new()?;
     let mut waiting = false;
     // Sessions in a row that ended in an error before running `STABLE`.
     let mut failures = 0u32;
     while !stop.load(Ordering::Relaxed) {
+        state.drain(&mut session);
         if let Some((pid, owner)) = claim::foreign() {
             log!("yielding to {owner} (pid {pid})");
             while claim::foreign().is_some() {
-                if sleep_unless_stopped(Duration::from_secs(1), &stop) {
+                if sleep_unless_stopped(Duration::from_secs(1), &stop, &mut session, &mut state) {
                     return Ok(());
                 }
             }
@@ -350,7 +428,7 @@ fn run(path: &Path) -> Result<()> {
                 log!("waiting for the MX Creative Keypad (USB)");
                 waiting = true;
             }
-            if sleep_unless_stopped(Duration::from_secs(1), &stop) {
+            if sleep_unless_stopped(Duration::from_secs(1), &stop, &mut session, &mut state) {
                 return Ok(());
             }
             api.refresh_devices()?;
@@ -361,8 +439,9 @@ fn run(path: &Path) -> Result<()> {
             waiting = false;
         }
         let started = Instant::now();
-        let served = connect(&mut session, &mut keypad, path, &mut loaded, &mut tiles, &stop);
+        let served = connect(&mut session, &mut keypad, &mut state, &stop);
         session.release_all();
+        state.forward(&mut session);
         let error = match served {
             // Blank the keys on the way out: images left behind would look
             // live while nothing answers the presses.
@@ -372,9 +451,10 @@ fn run(path: &Path) -> Result<()> {
                 // The claimant draws next: drop without clearing, and wait
                 // for the claim to go away before reopening and redrawing.
                 drop(keypad);
-                tiles.clear();
+                state.tiles.clear();
                 while claim::foreign().is_some() {
-                    if sleep_unless_stopped(Duration::from_secs(1), &stop) {
+                    if sleep_unless_stopped(Duration::from_secs(1), &stop, &mut session, &mut state)
+                    {
                         return Ok(());
                     }
                 }
@@ -395,7 +475,7 @@ fn run(path: &Path) -> Result<()> {
         failures = (failures + 1).min(5);
         let delay = Duration::from_secs(1 << failures);
         log!("{error:#}; reconnecting in {}s", delay.as_secs());
-        if sleep_unless_stopped(delay, &stop) {
+        if sleep_unless_stopped(delay, &stop, &mut session, &mut state) {
             return Ok(());
         }
         api.refresh_devices()?;
@@ -417,17 +497,17 @@ enum Outcome {
 fn connect(
     session: &mut Session,
     keypad: &mut Keypad,
-    path: &Path,
-    loaded: &mut Option<SystemTime>,
-    tiles: &mut HashMap<String, KeyImageJpeg>,
+    state: &mut RunState,
     stop: &AtomicBool,
 ) -> Result<Outcome> {
-    follow_page_buttons(session, keypad)?;
+    state.diverted = None;
+    state.drain(session);
+    follow_page_buttons(session, keypad, state)?;
     if let Some(level) = session.brightness() {
         keypad.set_brightness(level)?;
     }
-    show(session, keypad, tiles)?;
-    serve(session, keypad, path, loaded, tiles, stop)
+    show(session, keypad, &mut state.tiles)?;
+    serve(session, keypad, state, stop)
 }
 
 /// Act on presses and config changes until `stop` is set or a foreign claim
@@ -435,12 +515,12 @@ fn connect(
 fn serve(
     session: &mut Session,
     keypad: &mut Keypad,
-    path: &Path,
-    loaded: &mut Option<SystemTime>,
-    tiles: &mut HashMap<String, KeyImageJpeg>,
+    state: &mut RunState,
     stop: &AtomicBool,
 ) -> Result<Outcome> {
     while !stop.load(Ordering::Relaxed) {
+        let changed = state.drain(session);
+        follow_page_buttons(session, keypad, state)?;
         if let Some((pid, owner)) = claim::foreign() {
             return Ok(Outcome::Yielding(pid, owner));
         }
@@ -449,8 +529,13 @@ fn serve(
         let now = Instant::now();
         let flip = session.next_flip(now);
         let wake = [session.next_deadline(), flip].into_iter().flatten().min();
-        let timeout = wake.map_or(TICK, |at| at.saturating_duration_since(now).min(TICK));
-        for event in poll(keypad, stop, timeout)? {
+        let tick = state.tick();
+        let timeout = wake.map_or(tick, |at| at.saturating_duration_since(now).min(tick));
+        let events = poll(keypad, stop, timeout)?;
+        // A press can turn the page or shift; redraw after any. Tiles are
+        // cached and `Keypad::draw` skips unchanged keys, so this is cheap.
+        let mut redraw = changed || !events.is_empty();
+        for event in events {
             let result = match event {
                 Event::Down(button) => session.down(button),
                 Event::Up(button) => session.up(button),
@@ -460,17 +545,19 @@ fn serve(
             }
         }
         for (_, result) in session.tick() {
+            redraw = true;
             if let Err(error) = result {
                 log!("{error:#}");
             }
         }
-        if flip.is_some_and(|at| Instant::now() >= at) {
-            if let Err(error) = show(session, keypad, tiles) {
-                log!("blink: {error:#}");
+        state.forward(session);
+        if redraw || flip.is_some_and(|at| Instant::now() >= at) {
+            if let Err(error) = show(session, keypad, &mut state.tiles) {
+                log!("{error:#}");
             }
         }
         session.reap();
-        reload(session, path, loaded, keypad, tiles)?;
+        reload(session, keypad, state)?;
     }
     Ok(Outcome::Stopped)
 }
@@ -485,13 +572,23 @@ fn poll(keypad: &mut Keypad, stop: &AtomicBool, timeout: Duration) -> Result<Vec
 }
 
 /// Sleep for `delay` in ticks; `true` when `stop` was set meanwhile.
-fn sleep_unless_stopped(delay: Duration, stop: &AtomicBool) -> bool {
+fn sleep_unless_stopped(
+    delay: Duration,
+    stop: &AtomicBool,
+    session: &mut Session,
+    state: &mut RunState,
+) -> bool {
     let deadline = Instant::now() + delay;
     while Instant::now() < deadline {
         if stop.load(Ordering::Relaxed) {
             return true;
         }
-        std::thread::sleep(TICK);
+        state.drain(session);
+        std::thread::sleep(
+            state
+                .tick()
+                .min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
     stop.load(Ordering::Relaxed)
 }
