@@ -723,6 +723,23 @@ fn expand(icon: &str, base: &Path) -> PathBuf {
     base.join(icon)
 }
 
+/// The starter config, `examples/demo.json`, built in so a fresh install has
+/// one whichever way it was built.
+pub const STARTER: &str = include_str!("../examples/demo.json");
+
+/// Write the starter config to `path` unless something is already there.
+/// `Ok(true)` when it wrote it.
+pub fn seed(path: &Path) -> Result<bool> {
+    if path.symlink_metadata().is_ok() {
+        return Ok(false);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    std::fs::write(path, STARTER).with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(true)
+}
+
 /// Where the config lives when `--config` is not given:
 /// `$XDG_CONFIG_HOME/mx-keypad/config.json`, else `~/.config/mx-keypad/config.json`.
 #[must_use]
@@ -749,6 +766,18 @@ mod tests {
 
     fn error(json: &str) -> String {
         format!("{:#}", setup(json).unwrap_err())
+    }
+
+    #[test]
+    fn seeding_writes_the_starter_once() {
+        let dir = std::env::temp_dir().join(format!("mx-keypad-seed-{}", std::process::id()));
+        let path = dir.join("mx-keypad/config.json");
+        assert!(seed(&path).unwrap());
+        assert!(Setup::load(&path).is_ok());
+        std::fs::write(&path, "{}").unwrap();
+        assert!(!seed(&path).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

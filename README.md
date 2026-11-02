@@ -138,7 +138,10 @@ the key code and modifiers for a shortcut on the current keyboard layout.
 
 When `--config` is omitted, `run`, `check`, and `install` use
 `$XDG_CONFIG_HOME/mx-keypad/config.json` if `XDG_CONFIG_HOME` is absolute. Otherwise, they use
-`~/.config/mx-keypad/config.json`.
+`~/.config/mx-keypad/config.json`. If that file doesn't exist, `run` and `install` first write the
+starter config built into the binary, [examples/demo.json](examples/demo.json), so a fresh install
+works right away. They never overwrite an existing file, and they never write to a path you pass
+with `--config`.
 
 ## Configure pages and keys
 

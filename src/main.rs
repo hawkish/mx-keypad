@@ -112,7 +112,7 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Cmd::Run { config } => run(&config.unwrap_or_else(config::default_path)),
+        Cmd::Run { config } => run(&config.unwrap_or_else(default_config)),
         Cmd::Check { config, out } => {
             check(&config.unwrap_or_else(config::default_path), out.as_deref())
         }
@@ -141,7 +141,7 @@ fn main() -> Result<()> {
         Cmd::Events => events(),
         #[cfg(target_os = "macos")]
         Cmd::Install { config, identity } => {
-            let path = config.unwrap_or_else(config::default_path);
+            let path = config.unwrap_or_else(default_config);
             Setup::load(&path)?;
             service::install(&path, identity.as_deref())
         }
@@ -169,6 +169,19 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The default config path, with the starter config written there first if
+/// there's nothing yet, so a fresh install runs without writing one by hand.
+/// An explicit `--config` is never seeded: a missing file there is a typo.
+fn default_config() -> PathBuf {
+    let path = config::default_path();
+    match config::seed(&path) {
+        Ok(true) => log!("wrote the starter config to {}", path.display()),
+        Ok(false) => {}
+        Err(error) => log!("{error:#}"),
+    }
+    path
 }
 
 fn open(api: &HidApi) -> Result<Keypad> {
