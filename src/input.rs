@@ -33,6 +33,9 @@ pub enum Button {
     PageLeft,
     /// The right page button.
     PageRight,
+    /// A button on the MX Dialpad, 1–4: top-left, top-right, bottom-left,
+    /// bottom-right.
+    Dial(u8),
 }
 
 /// An edge on a button.
@@ -111,7 +114,7 @@ impl Decoder {
     }
 }
 
-fn diff(down: &mut BTreeSet<Button>, held: BTreeSet<Button>) -> Vec<Event> {
+pub(crate) fn diff(down: &mut BTreeSet<Button>, held: BTreeSet<Button>) -> Vec<Event> {
     let mut events: Vec<Event> = down.difference(&held).copied().map(Event::Up).collect();
     events.extend(held.difference(down).copied().map(Event::Down));
     *down = held;

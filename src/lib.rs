@@ -1,5 +1,6 @@
 //! Drive the Logitech MX Creative Keypad (`046d:c354`): images on its nine LCD
 //! keys, presses of those keys and its two page buttons, and panel brightness.
+//! [`dialpad`] adds the MX Dialpad (`046d:bc00`): its buttons, dial and roller.
 //!
 //! The wire protocol is ported from OpenLogi (MIT/Apache-2.0), re-expressed
 //! against blocking `hidapi`; see `PROTOCOL.md`. [`config`] reads the JSON
@@ -9,6 +10,7 @@ pub mod blink;
 pub mod claim;
 pub mod config;
 pub mod device;
+pub mod dialpad;
 pub mod geometry;
 mod hidpp;
 pub mod image;

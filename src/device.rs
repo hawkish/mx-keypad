@@ -58,9 +58,15 @@ impl Keypad {
         }) else {
             return Ok(None);
         };
-        let handle = api.open_path(info.path()).context(
-            "cannot open the MX Creative Keypad (is Logi Options+ or OpenLogi holding it?)",
-        )?;
+        // The Dialpad's watcher opens shared on another thread; hold the
+        // lock so this open stays exclusive.
+        let handle = {
+            let _lock = crate::dialpad::OPEN_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            api.open_path(info.path())
+        }
+        .context("cannot open the MX Creative Keypad (is Logi Options+ or OpenLogi holding it?)")?;
         Ok(Some(Keypad {
             handle,
             decoder: Decoder::default(),

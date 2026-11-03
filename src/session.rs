@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::blink;
-use crate::config::{Action, ResolvedPage, Setup};
+use crate::config::{Action, DialpadSetup, ResolvedPage, Setup, Turn};
+use crate::dialpad::Wheel;
 use crate::keys::{self, Chord};
 use crate::press::{Fire, LongPress};
 use crate::remote::ConnId;
@@ -65,6 +66,11 @@ pub struct Session {
     /// when: a client that reconnects soon and adds it again gets it back on
     /// screen, unless someone turned pages in between.
     returning: Option<(String, Instant)>,
+    /// Turn not yet acted on: the dial's, then the roller's.
+    turned: [i32; 2],
+    /// Dialpad bindings a client sent, which win over the config's while
+    /// that client is connected.
+    remote_dialpad: Option<(ConnId, DialpadSetup)>,
 }
 
 /// How long after a client drops its visible page that page still returns
@@ -88,6 +94,8 @@ impl Session {
             remote_held: HashMap::new(),
             remote_events: Vec::new(),
             returning: None,
+            turned: [0; 2],
+            remote_dialpad: None,
         }
     }
 
@@ -242,6 +250,7 @@ impl Session {
         self.remote.retain(|p| p.owner != owner);
         self.remote_held.retain(|_, (id, _)| *id != owner);
         self.remote_events.retain(|e| e.owner != owner);
+        self.set_remote_dialpad(owner, None);
         self.page = self.page_index(&current).unwrap_or(self.visible().start);
     }
 
@@ -299,6 +308,33 @@ impl Session {
     #[must_use]
     pub fn needs_page_buttons(&self) -> bool {
         !self.remote.is_empty() || self.setup.needs_page_buttons()
+    }
+
+    /// The Dialpad bindings in force: a client's, else the config's. `None`
+    /// when neither binds it, and it should keep its firmware behaviour.
+    #[must_use]
+    pub fn dialpad(&self) -> Option<&DialpadSetup> {
+        self.remote_dialpad
+            .as_ref()
+            .map(|(_, dialpad)| dialpad)
+            .or(self.setup.dialpad.as_ref())
+    }
+
+    /// Bind the Dialpad to `dialpad` for client `owner`, replacing any
+    /// client's bindings, or drop `owner`'s with `None`.
+    pub fn set_remote_dialpad(&mut self, owner: ConnId, dialpad: Option<DialpadSetup>) {
+        match dialpad {
+            Some(dialpad) => self.remote_dialpad = Some((owner, dialpad)),
+            None if self
+                .remote_dialpad
+                .as_ref()
+                .is_some_and(|(o, _)| *o == owner) =>
+            {
+                self.remote_dialpad = None;
+            }
+            None => return,
+        }
+        self.turned = [0; 2];
     }
 
     /// The configured panel brightness, if the config sets one. Apply this
@@ -405,7 +441,7 @@ impl Session {
                 };
                 long[usize::from(n) - 1].clone()
             }
-            Button::PageLeft | Button::PageRight => None,
+            Button::PageLeft | Button::PageRight | Button::Dial(_) => None,
         }
     }
 
@@ -423,6 +459,11 @@ impl Session {
             }
             Button::PageLeft => self.setup.left.clone(),
             Button::PageRight => self.setup.right.clone(),
+            Button::Dial(n) => self
+                .dialpad()
+                .and_then(|dialpad| dialpad.buttons.get(usize::from(n).checked_sub(1)?))
+                .cloned()
+                .unwrap_or_default(),
         }
     }
 
@@ -441,8 +482,56 @@ impl Session {
         result
     }
 
+    /// The Dialpad's `wheel` turned by `delta`: act once for every whole
+    /// `step` of turn, carrying the rest to the next turn. Turning back
+    /// drops what was carried, so reversing acts at once.
+    pub fn turn(&mut self, wheel: Wheel, delta: i32) -> Result<()> {
+        let Some(dialpad) = self.dialpad() else {
+            return Ok(());
+        };
+        let (slot, turn) = match wheel {
+            Wheel::Dial => (0, dialpad.dial.clone()),
+            Wheel::Roller => (1, dialpad.roller.clone()),
+        };
+        let Turn { minus, plus, step } = turn;
+        let step = i32::try_from(step).unwrap_or(i32::MAX);
+        let turned = &mut self.turned[slot];
+        if turned.signum() * delta.signum() < 0 {
+            *turned = 0;
+        }
+        *turned += delta;
+        let times = *turned / step;
+        *turned %= step;
+        let action = if times > 0 { plus } else { minus };
+        for _ in 0..times.unsigned_abs() {
+            self.act(&action)?;
+        }
+        Ok(())
+    }
+
     /// Do what `action` says, for `button`.
     fn perform_action(&mut self, button: Button, action: &Action) -> Result<()> {
+        match action {
+            Action::Hold(chord) => {
+                let resolved = Chord::parse(chord)?.resolve();
+                keys::press_modifiers(resolved.modifiers, true)?;
+                keys::press_key(resolved, true)?;
+                self.held.insert(button, Held::Hold(resolved));
+            }
+            Action::Switch(chord) => {
+                let resolved = Chord::parse(chord)?.resolve();
+                keys::press_modifiers(resolved.modifiers, true)?;
+                keys::press_key(resolved, true)?;
+                keys::press_key(resolved, false)?;
+                self.held.insert(button, Held::Switch(resolved.modifiers));
+            }
+            action => self.act(action)?,
+        }
+        Ok(())
+    }
+
+    /// Do what an `action` that holds nothing says.
+    fn act(&mut self, action: &Action) -> Result<()> {
         match action {
             Action::Page(name) => {
                 self.returning = None;
@@ -457,19 +546,6 @@ impl Session {
                 if let Some(to) = to {
                     self.page = to;
                 }
-            }
-            Action::Hold(chord) => {
-                let resolved = Chord::parse(chord)?.resolve();
-                keys::press_modifiers(resolved.modifiers, true)?;
-                keys::press_key(resolved, true)?;
-                self.held.insert(button, Held::Hold(resolved));
-            }
-            Action::Switch(chord) => {
-                let resolved = Chord::parse(chord)?.resolve();
-                keys::press_modifiers(resolved.modifiers, true)?;
-                keys::press_key(resolved, true)?;
-                keys::press_key(resolved, false)?;
-                self.held.insert(button, Held::Switch(resolved.modifiers));
             }
             Action::Sequence(steps) => {
                 // Resolve shortcuts here, on the caller's thread, where the
@@ -665,6 +741,48 @@ mod tests {
         assert!(s.shift.active());
         s.up(Button::Key(8)).unwrap();
         assert!(!s.shift.active());
+    }
+
+    #[test]
+    fn turns_act_once_a_step_and_reversing_starts_over() {
+        let mut s = session(
+            r#"{ "pages": [{ "name": "a" }, { "name": "b" }, { "name": "c" }], "dialpad": {
+                "dial": { "left": { "page": "prev" }, "right": { "page": "next" }, "step": 3 }
+            } }"#,
+        );
+        let name = |s: &Session| s.page_name().to_owned();
+        s.turn(Wheel::Dial, 2).unwrap();
+        assert_eq!(name(&s), "a");
+        s.turn(Wheel::Dial, 1).unwrap();
+        assert_eq!(name(&s), "b");
+        // A fast spin acts once per step in one report.
+        s.turn(Wheel::Dial, 7).unwrap();
+        assert_eq!(name(&s), "a");
+        // One step of the carried turn is left; turning back drops it.
+        s.turn(Wheel::Dial, -3).unwrap();
+        assert_eq!(name(&s), "c");
+        // The roller has nothing bound.
+        s.turn(Wheel::Roller, 5).unwrap();
+        assert_eq!(name(&s), "c");
+    }
+
+    #[test]
+    fn dialpad_buttons_act_like_page_buttons() {
+        let mut s = session(
+            r#"{ "pages": [{ "name": "a" }, { "name": "b" }], "dialpad": {
+                "buttons": { "4": { "page": "b" } }
+            } }"#,
+        );
+        s.down(Button::Dial(1)).unwrap();
+        s.up(Button::Dial(1)).unwrap();
+        assert_eq!(s.page_name(), "a");
+        s.down(Button::Dial(4)).unwrap();
+        s.up(Button::Dial(4)).unwrap();
+        assert_eq!(s.page_name(), "b");
+        // A config without a dialpad section ignores them.
+        let mut plain = session(r#"{ "pages": [{ "name": "a" }] }"#);
+        plain.down(Button::Dial(2)).unwrap();
+        plain.turn(Wheel::Dial, 90).unwrap();
     }
 
     #[test]

@@ -65,6 +65,10 @@ pub enum Request {
     Show(String),
     /// Remove an owned page.
     Remove(String),
+    /// Bind the MX Dialpad's controls for as long as this connection lasts,
+    /// in place of the config's `dialpad` section; `null` lets go. The last
+    /// connection to send one wins.
+    Dialpad(Option<config::DialpadConfig>),
 }
 
 /// A message from the agent to a client.
@@ -347,6 +351,10 @@ pub fn apply(session: &mut Session, id: ConnId, request: Request) -> Result<()> 
         }
         Request::Show(name) => session.show_remote(id, &name)?,
         Request::Remove(name) => session.remove_remote(id, &name)?,
+        Request::Dialpad(dialpad) => {
+            let resolved = dialpad.map(config::resolve_remote_dialpad).transpose()?;
+            session.set_remote_dialpad(id, resolved);
+        }
     }
     Ok(())
 }
@@ -361,6 +369,7 @@ pub struct Client {
     stream: Option<UnixStream>,
     connecting: Option<mpsc::Receiver<Result<UnixStream>>>,
     desired: Vec<(String, [Key; 9])>,
+    dialpad: Option<config::DialpadConfig>,
     input: Vec<u8>,
     errors: Vec<String>,
     retry: Instant,
@@ -386,6 +395,7 @@ impl Client {
             stream: None,
             connecting: None,
             desired: Vec::new(),
+            dialpad: None,
             input: Vec::new(),
             errors: Vec::new(),
             retry: Instant::now(),
@@ -422,6 +432,17 @@ impl Client {
             }
         };
         self.send(&request);
+    }
+
+    /// Bind the MX Dialpad's controls to `dialpad` while connected, or let
+    /// them go with `None`. Safe to call every frame: only a change is sent,
+    /// and the bindings are sent again after a reconnect.
+    pub fn set_dialpad(&mut self, dialpad: Option<config::DialpadConfig>) {
+        if dialpad == self.dialpad {
+            return;
+        }
+        self.dialpad = dialpad;
+        self.send(&Request::Dialpad(self.dialpad.clone()));
     }
 
     /// Turn the keypad to page `name`. Sent only while connected, so call
@@ -480,6 +501,9 @@ impl Client {
                                     keys: all_keys(&faces),
                                     show: false,
                                 });
+                            }
+                            if self.dialpad.is_some() {
+                                self.send(&Request::Dialpad(self.dialpad.clone()));
                             }
                         }
                         Err(error) => {
@@ -599,6 +623,8 @@ mod tests {
             r#"{"show":"agents"}"#,
             r#"{"remove":"agents"}"#,
             r#"{"page":{"name":"keys","keys":{"1":{"label":"Esc","action":{"keys":"escape"}}},"show":false}}"#,
+            r#"{"dialpad":{"buttons":{"1":{"keys":"escape"}},"dial":{"left":{"page":"prev"},"right":{"page":"next"},"step":5}}}"#,
+            r#"{"dialpad":null}"#,
         ] {
             let request: Request = serde_json::from_str(json).unwrap();
             assert_eq!(serde_json::to_string(&request).unwrap(), json);
@@ -657,6 +683,37 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_client_binds_the_dialpad_until_it_lets_go_or_leaves() {
+        let setup = config::Setup::resolve(
+            serde_json::from_str(r#"{"pages":[{"name":"main"},{"name":"other"}]}"#).unwrap(),
+            Path::new("."),
+        )
+        .unwrap();
+        let mut session = Session::new(setup);
+        let request = |json: &str| serde_json::from_str::<Request>(json).unwrap();
+        assert!(session.dialpad().is_none());
+        // Only next and prev, as on a client's page.
+        assert!(apply(
+            &mut session,
+            1,
+            request(r#"{"dialpad":{"buttons":{"1":{"page":"other"}}}}"#)
+        )
+        .is_err());
+        let bind = request(r#"{"dialpad":{"buttons":{"1":{"page":"next"}}}}"#);
+        apply(&mut session, 1, bind.clone()).unwrap();
+        session.down(Button::Dial(1)).unwrap();
+        assert_eq!(session.page_name(), "other");
+        // Another client's `null` leaves the first one's bindings alone.
+        apply(&mut session, 2, request(r#"{"dialpad":null}"#)).unwrap();
+        assert!(session.dialpad().is_some());
+        apply(&mut session, 1, request(r#"{"dialpad":null}"#)).unwrap();
+        assert!(session.dialpad().is_none());
+        apply(&mut session, 1, bind).unwrap();
+        session.drop_owner(1);
+        assert!(session.dialpad().is_none());
     }
 
     struct Sandbox(PathBuf);

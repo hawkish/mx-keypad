@@ -1,5 +1,6 @@
 //! Just enough HID++ 2.0 for the keypad: find a feature's index, divert the
 //! page buttons on `0x1b04`, and read and set panel brightness on `0x8040`.
+//! The Dialpad uses the same calls, plus `0x4610` for its dial and roller.
 //!
 //! The keypad answers on the same `ff43:1a02` node the vendor channel uses,
 //! so replies arrive interleaved with grid frames and image acks. A request
@@ -30,6 +31,10 @@ const ROOT: u8 = 0x00;
 pub(crate) const REPROG_CONTROLS_V4: u16 = 0x1b04;
 /// Panel brightness.
 pub(crate) const BRIGHTNESS_CONTROL: u16 = 0x8040;
+/// The Dialpad's dial and roller.
+pub(crate) const MULTI_ROLLER: u16 = 0x4610;
+/// Announces a reconnect, after which diverted controls are back to normal.
+pub(crate) const WIRELESS_STATUS: u16 = 0x1d4b;
 
 /// `0x1b04` setCidReporting flags: divert, and the divert-valid bit.
 const DIVERT: u8 = 0b11;
@@ -70,6 +75,11 @@ pub(crate) trait Link {
     /// Read one input report into `buf`, waiting up to `timeout`; `Ok(0)` when
     /// nothing came.
     fn read(&self, buf: &mut [u8], timeout: Duration) -> Result<usize, String>;
+    /// Whether the device only takes long reports, as the Dialpad's
+    /// Bluetooth node does: every request is then sent long.
+    fn long_only(&self) -> bool {
+        false
+    }
 }
 
 impl Link for hidapi::HidDevice {
@@ -98,7 +108,7 @@ pub(crate) fn call(
 ) -> Result<[u8; 16], HidppError> {
     let fn_swid = (function << 4) | SWID;
     // Short when the parameters fit, as the probes sent them; long otherwise.
-    let mut request = if params.len() <= 3 {
+    let mut request = if params.len() <= 3 && !link.long_only() {
         vec![SHORT, DEVICE, index, fn_swid, 0, 0, 0]
     } else {
         let mut long = vec![0; 20];
@@ -159,6 +169,17 @@ pub(crate) fn set_cid_reporting(
     let [hi, lo] = cid.to_be_bytes();
     let flags = if divert { DIVERT } else { UNDIVERT };
     call(link, reprog, 3, &[hi, lo, flags, 0, 0], stray).map(drop)
+}
+
+/// Divert roller `roller` on `0x4610` to us (`divert`), or hand it back.
+pub(crate) fn set_roller_mode(
+    link: &impl Link,
+    rollers: u8,
+    roller: u8,
+    divert: bool,
+    stray: &mut Vec<Vec<u8>>,
+) -> Result<(), HidppError> {
+    call(link, rollers, 3, &[roller, u8::from(divert)], stray).map(drop)
 }
 
 /// The brightness range `0x8040` advertises: `(min, max)`.
@@ -309,6 +330,46 @@ mod tests {
             link.written.borrow()[1],
             [SHORT, DEVICE, 0x0f, 0x2b, 0x00, 0x46, 0]
         );
+    }
+
+    /// The keypad's script, behind a node that only takes long reports.
+    struct LongOnly<L>(L);
+
+    impl<L: Link> Link for LongOnly<L> {
+        fn write(&self, report: &[u8]) -> Result<(), String> {
+            self.0.write(report)
+        }
+        fn read(&self, buf: &mut [u8], timeout: Duration) -> Result<usize, String> {
+            self.0.read(buf, timeout)
+        }
+        fn long_only(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_long_only_link_gets_every_request_long() {
+        let link = LongOnly(keypad());
+        let mut stray = Vec::new();
+        assert_eq!(
+            feature_index(&link, REPROG_CONTROLS_V4, &mut stray).unwrap(),
+            Some(0x0b)
+        );
+        let written = link.0.written.borrow();
+        assert_eq!(written[0].len(), 20);
+        assert_eq!(written[0][..6], [LONG, DEVICE, ROOT, SWID, 0x1b, 0x04]);
+    }
+
+    #[test]
+    fn roller_mode_writes_the_roller_and_the_divert_flag() {
+        // The Dialpad's 0x4610 sits at 13; this script refuses it, but the
+        // request is what matters.
+        let link = LongOnly(keypad());
+        let _ = set_roller_mode(&link, 0x0d, 1, true, &mut Vec::new());
+        let _ = set_roller_mode(&link, 0x0d, 0, false, &mut Vec::new());
+        let written = link.0.written.borrow();
+        assert_eq!(written[0][..6], [LONG, DEVICE, 0x0d, 0x3b, 0x01, 0x01]);
+        assert_eq!(written[1][..6], [LONG, DEVICE, 0x0d, 0x3b, 0x00, 0x00]);
     }
 
     #[test]

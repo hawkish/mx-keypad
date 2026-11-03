@@ -1,7 +1,8 @@
 # mx-keypad
 
 Control the Logitech MX Creative Keypad over USB with a JSON configuration. Set images and actions
-for its nine 118 × 118 LCD keys, assign the two page buttons, and adjust panel brightness.
+for its nine 118 × 118 LCD keys, assign the two page buttons, and adjust panel brightness. Bind
+the [MX Dialpad](#add-an-mx-dialpad)'s buttons, dial, and roller in the same configuration.
 
 The Rust library exposes the same device operations without an async runtime. Other programs can
 add [remote pages](#remote-pages) while the agent keeps running your configured actions.
@@ -132,7 +133,8 @@ mx-keypad resolve 'cmd+['
 `check` renders every key on every page without a device; `--out` saves them as
 `<page>-<key>.jpg`. `draw` accepts a key number and a built-in icon name or image path; its
 background and foreground default to black and white. `brightness` accepts 1–100. `events` prints
-key and page-button press and release events, and `icons` lists the built-in names. `draw`,
+key and page-button press and release events, and the MX Dialpad's button presses and turns when one
+is connected. `icons` lists the built-in names. `draw`,
 `brightness`, and `events` need the keypad; `check`, `icons`, and `resolve` don't. `resolve` prints
 the key code and modifiers for a shortcut on the current keyboard layout.
 
@@ -294,6 +296,55 @@ terminal app; inside tmux, grant it to the tmux server. Because tmux runs as a s
 granting permission to the terminal alone doesn't help. Use the LaunchAgent to have macOS request
 permission for mx-keypad itself. Rebuilding the binary may cause macOS to ask again.
 
+## Add an MX Dialpad
+
+`run` can also act on the MX Dialpad's four buttons, its big dial, and its small roller. The
+Dialpad has no screens, so it doesn't have pages of its own. Its bindings stay the same whichever
+keypad page is showing, and they can turn the keypad's pages. Add a `dialpad` section to your
+configuration, as in [examples/dialpad.json](examples/dialpad.json):
+
+```json
+"dialpad": {
+  "buttons": {
+    "1": { "keys": "cmd+z" },
+    "2": { "keys": "cmd+shift+z" },
+    "3": { "page": "prev" },
+    "4": { "page": "next" }
+  },
+  "dial": { "left": { "media": "volume-down" }, "right": { "media": "volume-up" }, "step": 10 },
+  "roller": { "up": { "keys": "cmd+=" }, "down": { "keys": "cmd+-" } }
+}
+```
+
+| Field | Description |
+| --- | --- |
+| `dialpad.buttons` | Optional object mapping button numbers to actions: `"1"` top left, `"2"` top right, `"3"` bottom left, `"4"` bottom right. Omitted buttons do nothing. |
+| `dialpad.dial.left` | Optional action for turning the dial counterclockwise. |
+| `dialpad.dial.right` | Optional action for turning the dial clockwise. |
+| `dialpad.dial.step` | How much turn performs the action once. The dial measures 180 steps per revolution. Default: `5`, which is 36 actions per revolution. |
+| `dialpad.roller.up` | Optional action for rolling away from you. |
+| `dialpad.roller.down` | Optional action for rolling toward you. |
+| `dialpad.roller.step` | How many roller notches perform the action once. The roller has 40 per revolution. Default: `1`. |
+
+Buttons take any action, as page buttons do, and ignore shift. A turn performs its action once per
+`step`, so it can't use `hold`, `switch`, or `shift`. Turning back the other way starts counting
+again, so reversing acts right away.
+
+Pair the Dialpad over Bluetooth and quit Logi Options+, which also takes over its controls.
+Connecting through a Logi Bolt receiver isn't supported. While `run` serves a `dialpad` section,
+it takes over all of the Dialpad's controls, so they stop sending mouse buttons and scrolling. It
+waits for the Dialpad and reconnects independently of the keypad, and works without a keypad
+connected. When `run` stops, or you remove the `dialpad` section, it hands the controls back to
+the firmware. Without a `dialpad` section, `run` doesn't open the Dialpad.
+
+On macOS, opening the Dialpad needs **Input Monitoring** permission, because it's also a mouse.
+Turn it on for mx-keypad under **System Settings** > **Privacy & Security** > **Input
+Monitoring**. When you run mx-keypad from a terminal, the terminal needs the permission instead.
+If the permission is missing, `run` logs "macOS refused to open the MX Dialpad". If the switch is
+already on, a terminal that was updated since you granted it may no longer match the permission:
+remove the terminal from the list, add it again, and restart it. Dialpad support has only been
+tested on macOS.
+
 ## Use the library
 
 Add the local crate and `hidapi` to your project's `Cargo.toml`. Replace the path with the path to
@@ -379,6 +430,7 @@ Protocol v1 uses newline-delimited JSON. Send `hello` first and wait for `welcom
 | Client → agent | `{"keys":{"page":"agents","keys":{"3":{"icon":"bell"}}}}` | Replace the specified keys. |
 | Client → agent | `{"show":"agents"}` | Turn to an owned page. |
 | Client → agent | `{"remove":"agents"}` | Remove an owned page. |
+| Client → agent | `{"dialpad":{"buttons":{"1":{"keys":"escape"}}}}` / `{"dialpad":null}` | Bind the MX Dialpad, in the config's `dialpad` format, or let it go. |
 | Agent → client | `{"down":{"page":"agents","key":3}}` / `{"up":{"page":"agents","key":3}}` | Press or release of a grid key, numbered 1–9, that has no action or long press. |
 | Agent → client | `{"error":{"message":"…"}}` | Refused request. After the handshake, the connection stays open. |
 
@@ -401,6 +453,12 @@ A release goes to the page that received its press, even after a page turn. Shif
 blink work on remote pages as on config pages, and the keypad's shift is shared by every page.
 A client that reconnects within a minute and adds its page again gets it back on screen, if that
 page was showing and no page was turned in between.
+
+A client's `dialpad` bindings replace the config's `dialpad` section until the client sends
+`{"dialpad":null}` or disconnects; then the config's bindings, if any, apply again. If several
+clients send bindings, the last one wins. As on client pages, `page` actions can only be `next` or
+`prev`. The agent takes over the Dialpad while either the config or a client binds it. See
+[Add an MX Dialpad](#add-an-mx-dialpad).
 
 With the `mx-keypad` dependency above, publish a page and handle its presses in Rust:
 
@@ -434,7 +492,9 @@ fn main() {
 
 Call `poll()` each frame: it doesn't block, and connection handshakes run on a worker thread.
 The client reconnects with a 1-second backoff, doubling to 30 seconds, and resends its desired
-pages in insertion order. Repeated `set_page` calls send only changed keys. Use `show(name)` after
+pages in insertion order, then its Dialpad bindings. Repeated `set_page` calls send only changed
+keys. `set_dialpad(Some(bindings))` binds the Dialpad and `set_dialpad(None)` lets it go; repeating
+the same bindings sends nothing. Use `show(name)` after
 `connected()` becomes true to turn to a page, or `remove(name)` to stop publishing it.
 Read connection and protocol errors with `take_errors()`.
 

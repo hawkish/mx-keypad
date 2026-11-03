@@ -1,4 +1,4 @@
-# MX Creative Keypad wire protocol
+# MX Creative Keypad and MX Dialpad wire protocol
 
 These are the facts `mx-keypad` relies on. They were measured on hardware with OpenLogi's probes
 (`crates/openlogi-hid/examples/mx_keypad_{probe,grid_probe,lcd_probe}.rs`, 2026-10, `046d:c354`,
@@ -88,3 +88,79 @@ OpenLogi's HID++ crate and `mx-keypad` use `0b10`.
 The hardware answered getInfo with `00 64 65 10 00 00`: max 100, 101 steps, min 0, and
 capabilities `TRANSIENT`, so the device doesn't keep the level after it powers off. **Never write
 0.** The reference driver says it resets the device, so `mx-keypad` clamps to at least 1.
+
+## MX Dialpad
+
+These facts were measured on an MX Dialpad (`046d:bc00`, firmware `RBO07.00_0016`, HID++ 4.5)
+over Bluetooth Low Energy on macOS, 2026-11, with throwaway probes that listed the feature table
+and logged raw reports while each control was used in turn.
+
+### The node
+
+The Dialpad has no screens, no USB data connection, and no vendor channel. Over Bluetooth it's one
+HID device with three collections: mouse (`0001:0002`), pointer (`0001:0001`), and HID++
+(`0xff43`, usage `0x0202`). The HID++ collection's input and output reports are at most 20 bytes,
+so **send every request as a long report** (`0x11`). The device index is `0xff`.
+
+macOS refuses to open the device exclusively because it has a mouse collection. Even a shared open
+fails with `0xE00002E2` ("not permitted") unless the process, or the app responsible for it, has
+**Input Monitoring** permission. The system log then shows `TCC deny IOHIDDeviceOpen`. hidapi's
+exclusive-open setting is global, so `mx-keypad` holds a lock while it opens the Dialpad shared, and
+opens the keypad exclusively under the same lock.
+
+Undiverted, every control arrives on mouse report `0x02`:
+
+```text
+02 [buttons] [x:2] [y:2] [wheel] [hwheel]
+```
+
+The four buttons are mouse buttons 4–7 (`08`, `10`, `20`, `40`), and the dial and roller are the
+wheels. The system sees these too, so they scroll and go back and forward. A diverted control
+sends nothing on this report.
+
+### Feature table
+
+| Index | Feature | Used for |
+|---|---|---|
+| 4 | `0x1d4b` WirelessDeviceStatus | Its broadcast means the Dialpad reconnected and forgot the divert. |
+| 10 | `0x1b04` ReprogControlsV4, v6 | The buttons. |
+| 13 | `0x4610` MultiRoller, v1 | The dial and roller. |
+
+`mx-keypad` looks the indexes up at runtime, as it does for the keypad.
+
+### `0x1b04`: the buttons
+
+| Button | CID | TID |
+|---|---|---|
+| Top-left | `0x0053` | `0x003c` |
+| Top-right | `0x0056` | `0x003e` |
+| Bottom-left | `0x0059` | `0x0109` |
+| Bottom-right | `0x005a` | `0x0109` |
+
+All four report flags `0x31`, so they're divertable. Diverting and handing back use the same
+setCidReporting calls as the keypad's page buttons, and the diverted notification has the same
+held-set shape: `11 ff [index] 00 [cid:2]×4`.
+
+### `0x4610` MultiRoller: the dial and roller
+
+| Function | Request | Reply |
+|---|---|---|
+| 0 | | `[rollers]`: `02` |
+| 1 | `[roller]` | `[steps per revolution] 00 [flags]`: roller 0 `28 00 1f`, roller 1 `b4 00 1f` |
+| 2 (getMode) | `[roller]` | `[mode]`: `00` firmware, `01` diverted |
+| 3 (setMode) | `[roller] [mode]` | `[roller] [mode]` |
+
+Roller 0 is the small roller, at 40 steps a revolution. Roller 1 is the big dial, at 180 steps a
+revolution. A roller number past the last one is refused with error `0x02`. While a roller is
+diverted, each turn sends:
+
+```text
+11 ff [index] 00 [roller] [delta:i8] [timestamp:4]
+```
+
+`delta` is signed: clockwise for the dial and away from you for the roller are positive. A fast
+turn sends deltas larger than 1. `timestamp` is a big-endian millisecond counter. Reports arrived
+about every 45 ms while a control was turning.
+
+The divert doesn't survive a reconnect. When `0x1d4b` broadcasts, or a button or wheel shows up on
+mouse report `0x02`, `mx-keypad` diverts again.

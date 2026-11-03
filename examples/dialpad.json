@@ -1,0 +1,21 @@
+{
+  "pages": [
+    {
+      "name": "main",
+      "keys": {
+        "1": { "icon": "play", "label": "Play", "action": { "media": "play-pause" } }
+      }
+    },
+    { "name": "second" }
+  ],
+  "dialpad": {
+    "buttons": {
+      "1": { "keys": "cmd+z" },
+      "2": { "keys": "cmd+shift+z" },
+      "3": { "page": "prev" },
+      "4": { "page": "next" }
+    },
+    "dial": { "left": { "media": "volume-down" }, "right": { "media": "volume-up" }, "step": 10 },
+    "roller": { "up": { "keys": "cmd+=" }, "down": { "keys": "cmd+-" } }
+  }
+}

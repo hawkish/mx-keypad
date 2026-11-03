@@ -12,6 +12,7 @@ use hidapi::HidApi;
 
 use mx_keypad::claim;
 use mx_keypad::config::{self, Setup};
+use mx_keypad::dialpad::{Feed, Input, Watcher};
 use mx_keypad::geometry::DISPLAY;
 use mx_keypad::keys::{self, Chord};
 use mx_keypad::remote::{self, Incoming, Reply, Server};
@@ -34,6 +35,10 @@ const STABLE: Duration = Duration::from_secs(30);
 
 /// How often `run` wakes to check for a config change or a signal.
 const TICK: Duration = Duration::from_millis(200);
+
+/// How often `run` wakes while a Dialpad is connected: its input arrives on
+/// another thread, and the keypad's read cannot be woken for it.
+const DIAL_TICK: Duration = Duration::from_millis(10);
 
 #[derive(Parser)]
 #[command(
@@ -246,12 +251,38 @@ fn check(path: &Path, out: Option<&Path>) -> Result<()> {
 fn events() -> Result<()> {
     let stop = interrupted()?;
     let api = HidApi::new()?;
-    let mut keypad = open(&api)?;
-    keypad.divert_page_buttons(true)?;
+    // Either device will do: the keypad may be missing, or held by the agent.
+    let mut keypad = match Keypad::open(&api) {
+        Ok(Some(mut keypad)) => {
+            keypad.divert_page_buttons(true)?;
+            Some(keypad)
+        }
+        Ok(None) => {
+            println!("no MX Creative Keypad found (it only works over USB)");
+            None
+        }
+        Err(error) => {
+            println!("{error:#}");
+            None
+        }
+    };
+    let dialpad = Watcher::spawn()?;
     println!("press keys; Ctrl-C to stop");
     while !stop.load(Ordering::Relaxed) {
-        for event in poll(&mut keypad, &stop, TICK)? {
-            println!("{event:?}");
+        match &mut keypad {
+            Some(keypad) => {
+                for event in poll(keypad, &stop, DIAL_TICK)? {
+                    println!("{event:?}");
+                }
+            }
+            None => std::thread::sleep(DIAL_TICK),
+        }
+        for feed in dialpad.drain() {
+            match feed {
+                Feed::Connected => println!("dialpad connected"),
+                Feed::Lost(reason) => println!("{reason}"),
+                Feed::Input(input) => println!("{input:?}"),
+            }
         }
     }
     Ok(())
@@ -304,10 +335,71 @@ struct RunState {
     tiles: HashMap<String, KeyImageJpeg>,
     server: Option<Server>,
     diverted: Option<bool>,
+    /// Watches the Dialpad while the setup binds it.
+    dialpad: Option<Watcher>,
+    dialpad_connected: bool,
 }
 
 impl RunState {
+    /// Act on what remote clients and the Dialpad sent; `true` when anything
+    /// came, so the keypad may need redrawing.
     fn drain(&mut self, session: &mut Session) -> bool {
+        let dialpad = self.drain_dialpad(session);
+        let remote = self.drain_remote(session);
+        // A client may have bound the Dialpad, or let it go.
+        self.follow_dialpad(session);
+        remote || dialpad
+    }
+
+    /// Watch the Dialpad only while the setup or a client binds it, so it
+    /// keeps its firmware behaviour otherwise.
+    fn follow_dialpad(&mut self, session: &Session) {
+        let wanted = session.dialpad().is_some();
+        if wanted == self.dialpad.is_some() {
+            return;
+        }
+        self.dialpad_connected = false;
+        if !wanted {
+            // Dropping the watcher hands the Dialpad's controls back.
+            self.dialpad = None;
+            return;
+        }
+        match Watcher::spawn() {
+            Ok(watcher) => self.dialpad = Some(watcher),
+            Err(error) => log!("cannot watch the MX Dialpad: {error:#}"),
+        }
+    }
+
+    fn drain_dialpad(&mut self, session: &mut Session) -> bool {
+        let Some(watcher) = &self.dialpad else {
+            return false;
+        };
+        let mut changed = false;
+        for feed in watcher.drain() {
+            let result = match feed {
+                Feed::Connected => {
+                    log!("dialpad connected");
+                    self.dialpad_connected = true;
+                    continue;
+                }
+                Feed::Lost(reason) => {
+                    log!("{reason}");
+                    self.dialpad_connected = false;
+                    continue;
+                }
+                Feed::Input(Input::Button(Event::Down(button))) => session.down(button),
+                Feed::Input(Input::Button(Event::Up(button))) => session.up(button),
+                Feed::Input(Input::Turn(wheel, delta)) => session.turn(wheel, delta),
+            };
+            changed = true;
+            if let Err(error) = result {
+                log!("{error:#}");
+            }
+        }
+        changed
+    }
+
+    fn drain_remote(&mut self, session: &mut Session) -> bool {
         let Some(server) = &mut self.server else {
             return false;
         };
@@ -352,7 +444,9 @@ impl RunState {
     }
 
     fn tick(&self) -> Duration {
-        if self.server.as_ref().is_some_and(Server::has_clients) {
+        if self.dialpad_connected {
+            DIAL_TICK
+        } else if self.server.as_ref().is_some_and(Server::has_clients) {
             Duration::from_millis(50)
         } else {
             TICK
@@ -362,7 +456,7 @@ impl RunState {
 
 /// Reload when the file changed; keep the old setup if the new one is
 /// broken, so a half-saved edit does not blank the keypad.
-fn reload(session: &mut Session, keypad: &mut Keypad, state: &mut RunState) -> Result<()> {
+fn reload(session: &mut Session, keypad: Option<&mut Keypad>, state: &mut RunState) -> Result<()> {
     let modified = mtime(&state.path);
     if modified == state.loaded {
         return Ok(());
@@ -376,11 +470,15 @@ fn reload(session: &mut Session, keypad: &mut Keypad, state: &mut RunState) -> R
             session.reload(setup);
             // Image files may have changed along with the config.
             state.tiles.clear();
+            state.follow_dialpad(session);
+            log!("reloaded {}", state.path.display());
+            let Some(keypad) = keypad else {
+                return Ok(());
+            };
             follow_page_buttons(session, keypad, state)?;
             if let Some(level) = session.brightness() {
                 keypad.set_brightness(level)?;
             }
-            log!("reloaded {}", state.path.display());
             show(session, keypad, &mut state.tiles)
         }
         Err(error) => {
@@ -419,7 +517,10 @@ fn run(path: &Path) -> Result<()> {
         tiles: HashMap::new(),
         server,
         diverted: None,
+        dialpad: None,
+        dialpad_connected: false,
     };
+    state.follow_dialpad(&session);
     let mut api = HidApi::new()?;
     let mut waiting = false;
     // Sessions in a row that ended in an error before running `STABLE`.
@@ -570,7 +671,7 @@ fn serve(
             }
         }
         session.reap();
-        reload(session, keypad, state)?;
+        reload(session, Some(keypad), state)?;
     }
     Ok(Outcome::Stopped)
 }
@@ -597,6 +698,11 @@ fn sleep_unless_stopped(
             return true;
         }
         state.drain(session);
+        // No keypad to draw on, but the Dialpad may still be in use.
+        session.reap();
+        if let Err(error) = reload(session, None, state) {
+            log!("{error:#}");
+        }
         std::thread::sleep(
             state
                 .tick()

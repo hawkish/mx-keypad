@@ -9,7 +9,12 @@
 //!         "1": { "icon": "square-terminal", "label": "Shell", "action": { "run": "open -a Terminal" } },
 //!         "9": { "icon": "chevron-right", "action": { "page": "next" } } } }
 //!   ],
-//!   "page_buttons": { "left": { "page": "prev" }, "right": { "page": "next" } }
+//!   "page_buttons": { "left": { "page": "prev" }, "right": { "page": "next" } },
+//!   "dialpad": {
+//!     "buttons": { "1": { "media": "play-pause" } },
+//!     "dial": { "left": { "media": "volume-down" }, "right": { "media": "volume-up" }, "step": 10 },
+//!     "roller": { "up": { "page": "prev" }, "down": { "page": "next" } }
+//!   }
 //! }
 //! ```
 //!
@@ -40,6 +45,66 @@ pub struct Config {
     /// What the two page buttons do.
     #[serde(default)]
     pub page_buttons: PageButtons,
+    /// What the MX Dialpad's controls do. Without it, the Dialpad is left
+    /// alone and keeps its firmware behaviour.
+    #[serde(default)]
+    pub dialpad: Option<DialpadConfig>,
+}
+
+/// The MX Dialpad's bindings. Serializes too, so a remote client can send
+/// them in exactly this shape.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DialpadConfig {
+    /// Buttons by position, `"1"`–`"4"`: top-left, top-right, bottom-left,
+    /// bottom-right. Missing buttons do nothing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub buttons: BTreeMap<String, Action>,
+    /// The big dial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial: Option<Dial>,
+    /// The small roller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roller: Option<Roller>,
+}
+
+/// What turning the dial does, once per `step`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dial {
+    /// Counter-clockwise.
+    #[serde(default)]
+    pub left: Action,
+    /// Clockwise.
+    #[serde(default)]
+    pub right: Action,
+    /// How much turn fires the action once; the dial makes 180 a revolution.
+    #[serde(default = "dial_step")]
+    pub step: u32,
+}
+
+/// What turning the roller does, once per `step`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Roller {
+    /// Away from you.
+    #[serde(default)]
+    pub up: Action,
+    /// Toward you.
+    #[serde(default)]
+    pub down: Action,
+    /// How many notches fire the action once; the roller has 40 a
+    /// revolution.
+    #[serde(default = "roller_step")]
+    pub step: u32,
+}
+
+/// 36 actions a revolution of the dial.
+fn dial_step() -> u32 {
+    5
+}
+fn roller_step() -> u32 {
+    1
 }
 
 /// Face settings every key inherits.
@@ -323,6 +388,51 @@ pub struct Setup {
     pub right: Action,
     /// How long a press must last to count as a long press.
     pub long_press: std::time::Duration,
+    /// The Dialpad's bindings, when the config has a `dialpad` section.
+    pub dialpad: Option<DialpadSetup>,
+}
+
+/// The Dialpad's bindings, validated.
+#[derive(Debug, Clone, Default)]
+pub struct DialpadSetup {
+    /// Buttons 1–4 at indexes 0–3.
+    pub buttons: [Action; 4],
+    /// The dial: counter-clockwise, clockwise, and its step.
+    pub dial: Turn,
+    /// The roller: down, up, and its step.
+    pub roller: Turn,
+}
+
+/// What a turning control does each `step` in either direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Turn {
+    /// Counter-clockwise, or down.
+    pub minus: Action,
+    /// Clockwise, or up.
+    pub plus: Action,
+    /// How much turn fires one action.
+    pub step: u32,
+}
+
+impl Default for Turn {
+    fn default() -> Self {
+        Turn {
+            minus: Action::None,
+            plus: Action::None,
+            step: 1,
+        }
+    }
+}
+
+impl DialpadSetup {
+    fn actions(&self) -> impl Iterator<Item = &Action> {
+        self.buttons.iter().chain([
+            &self.dial.minus,
+            &self.dial.plus,
+            &self.roller.minus,
+            &self.roller.plus,
+        ])
+    }
 }
 
 /// A page with all nine keys filled in.
@@ -380,6 +490,10 @@ impl Setup {
     pub fn sends_keys(&self) -> bool {
         self.left.sends_keys()
             || self.right.sends_keys()
+            || self
+                .dialpad
+                .iter()
+                .any(|dialpad| dialpad.actions().any(Action::sends_keys))
             || self.pages.iter().any(|page| {
                 page.keys.iter().any(|(_, action)| action.sends_keys())
                     || page.long.iter().flatten().any(Action::sends_keys)
@@ -427,12 +541,17 @@ impl Setup {
                 base,
             )?);
         }
+        let dialpad = config
+            .dialpad
+            .map(|dialpad| resolve_dialpad(dialpad, &names))
+            .transpose()?;
         Ok(Setup {
             brightness: config.brightness,
             pages,
             left: config.page_buttons.left,
             right: config.page_buttons.right,
             long_press: std::time::Duration::from_millis(defaults.long_press_ms),
+            dialpad,
         })
     }
 
@@ -688,6 +807,59 @@ fn check_step(action: &Action, names: &[&str], at: &str, in_sequence: bool) -> R
         }),
         _ => Ok(()),
     }
+}
+
+/// Resolve Dialpad bindings a remote client sent. As on a remote page, its
+/// `page` actions can only be `next` or `prev`.
+pub fn resolve_remote_dialpad(config: DialpadConfig) -> Result<DialpadSetup> {
+    resolve_dialpad(config, &[])
+}
+
+/// Validate the Dialpad's bindings. Turns fire without a release, so they
+/// cannot hold anything: no `hold`, `switch` or `shift`.
+fn resolve_dialpad(config: DialpadConfig, names: &[&str]) -> Result<DialpadSetup> {
+    let mut buttons: [Action; 4] = Default::default();
+    for (index, action) in config.buttons {
+        let n = index
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=4).contains(n))
+            .with_context(|| format!("dialpad.buttons: {index:?} is not a button (1–4)"))?;
+        check_action(&action, names, &format!("dialpad.buttons.{index}"))?;
+        buttons[n - 1] = action;
+    }
+    let turn = |minus: Action, plus: Action, step: u32, at: &str, names_: [&str; 2]| {
+        if step == 0 {
+            bail!("dialpad.{at}.step: must be at least 1");
+        }
+        for (action, name) in [(&minus, names_[0]), (&plus, names_[1])] {
+            let at = format!("dialpad.{at}.{name}");
+            if action.is_held() || matches!(action, Action::Shift(_)) {
+                bail!("{at}: a turn cannot hold, switch or shift");
+            }
+            check_action(action, names, &at)?;
+        }
+        Ok(Turn { minus, plus, step })
+    };
+    let dial = match config.dial {
+        Some(dial) => turn(dial.left, dial.right, dial.step, "dial", ["left", "right"])?,
+        None => Turn::default(),
+    };
+    let roller = match config.roller {
+        Some(roller) => turn(
+            roller.down,
+            roller.up,
+            roller.step,
+            "roller",
+            ["down", "up"],
+        )?,
+        None => Turn::default(),
+    };
+    Ok(DialpadSetup {
+        buttons,
+        dial,
+        roller,
+    })
 }
 
 /// A built-in name when one exists; otherwise a file path that must exist and
@@ -989,6 +1161,42 @@ mod tests {
         )
         .unwrap();
         assert!(bound.needs_page_buttons());
+    }
+
+    #[test]
+    fn a_dialpad_section_resolves_with_default_steps() {
+        let resolved = setup(
+            r#"{ "pages": [{ "name": "a" }, { "name": "b" }], "dialpad": {
+                "buttons": { "2": { "media": "mute" } },
+                "dial": { "left": { "media": "volume-down" }, "right": { "media": "volume-up" } },
+                "roller": { "up": { "page": "prev" }, "down": { "page": "b" }, "step": 2 }
+            } }"#,
+        )
+        .unwrap();
+        let dialpad = resolved.dialpad.unwrap();
+        assert_eq!(dialpad.buttons[0], Action::None);
+        assert_eq!(dialpad.buttons[1], Action::Media("mute".into()));
+        assert_eq!(dialpad.dial.plus, Action::Media("volume-up".into()));
+        assert_eq!(dialpad.dial.step, 5);
+        assert_eq!(dialpad.roller.minus, Action::Page("b".into()));
+        assert_eq!(dialpad.roller.step, 2);
+        assert!(setup(r#"{ "pages": [{ "name": "a" }] }"#)
+            .unwrap()
+            .dialpad
+            .is_none());
+    }
+
+    #[test]
+    fn dialpad_mistakes_are_refused() {
+        let bad = |dialpad: &str| {
+            let json = format!(r#"{{ "pages": [{{ "name": "a" }}], "dialpad": {dialpad} }}"#);
+            setup(&json).unwrap_err().to_string()
+        };
+        assert!(bad(r#"{ "buttons": { "5": { "run": "true" } } }"#).contains("not a button"));
+        assert!(bad(r#"{ "dial": { "right": { "hold": "cmd" } } }"#).contains("cannot hold"));
+        assert!(bad(r#"{ "roller": { "up": { "shift": "once" } } }"#).contains("cannot hold"));
+        assert!(bad(r#"{ "dial": { "step": 0 } }"#).contains("at least 1"));
+        assert!(bad(r#"{ "roller": { "down": { "page": "zz" } } }"#).contains("no page"));
     }
 
     #[test]
