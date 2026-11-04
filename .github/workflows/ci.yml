@@ -33,6 +33,8 @@ jobs:
     # macOS compiles the keystroke, Accessibility and LaunchAgent code that
     # Linux skips; Linux compiles the hidraw backend tmux-legion builds on.
     strategy:
+      # A failure on one system shouldn't hide the other's result.
+      fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}

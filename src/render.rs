@@ -330,7 +330,33 @@ fn fontdb() -> &'static Arc<usvg::fontdb::Database> {
     static FONTS: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
     FONTS.get_or_init(|| {
         let mut options = usvg::Options::default();
-        options.fontdb_mut().load_system_fonts();
+        let fonts = options.fontdb_mut();
+        fonts.load_system_fonts();
+        // Labels ask for sans-serif, which fontdb maps to Arial: most Linux
+        // systems lack it and would draw nothing. Fall back to a common
+        // sans, then to any face at all.
+        let installed = |name: &str| {
+            fonts
+                .faces()
+                .any(|face| face.families.iter().any(|(family, _)| family == name))
+        };
+        let sans = [
+            "Arial",
+            "Helvetica",
+            "DejaVu Sans",
+            "Liberation Sans",
+            "Noto Sans",
+        ]
+        .into_iter()
+        .find(|name| installed(name))
+        .map(str::to_owned)
+        .or_else(|| {
+            let face = fonts.faces().next()?;
+            Some(face.families.first()?.0.clone())
+        });
+        if let Some(sans) = sans {
+            fonts.set_sans_serif_family(sans);
+        }
         options.fontdb
     })
 }
