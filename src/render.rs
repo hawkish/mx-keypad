@@ -601,6 +601,15 @@ mod tests {
         Some((*rows.first()?, *rows.last()?))
     }
 
+    /// The columns of `jpeg` that hold any light pixel, as (first, last).
+    fn ink_columns(jpeg: &KeyImageJpeg) -> Option<(u32, u32)> {
+        let decoded = image::load_from_memory(jpeg.as_bytes()).unwrap().to_rgb8();
+        let columns: Vec<u32> = (0..decoded.width())
+            .filter(|&x| (0..decoded.height()).any(|y| decoded.get_pixel(x, y)[0] > 128))
+            .collect();
+        Some((*columns.first()?, *columns.last()?))
+    }
+
     #[test]
     fn a_line_break_draws_two_lines_and_a_word_fills_the_key() {
         if fontdb().faces().next().is_none() {
@@ -624,8 +633,11 @@ mod tests {
             "two lines are taller than one"
         );
         // The old estimate drew "switch" about 16 px tall; measuring the ink
-        // lets it grow to the tile's width.
-        assert!(one_line > 20, "switch is drawn {one_line} px tall");
+        // lets it grow to the tile's width. Its height depends on the font,
+        // so check the width it fills.
+        let (left, right) = ink_columns(&tile("switch")).unwrap();
+        let width = right - left;
+        assert!(width >= 84, "switch is drawn {width} px wide");
         // And it stays inside the tile, centred.
         assert!(top >= 4 && bottom <= 114, "{top}..{bottom}");
     }
