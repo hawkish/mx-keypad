@@ -9,6 +9,14 @@ add [remote pages](#remote-pages) while the agent keeps running your configured 
 
 ## Install and check a configuration
 
+Releases are source only, so build mx-keypad with Nix or Cargo. Install a release tag:
+
+```sh
+nix profile install github:hawkish/mx-keypad/v0.10.0
+# Or, with Rust and Cargo installed:
+cargo install --git https://github.com/hawkish/mx-keypad --tag v0.10.0
+```
+
 From a checkout, install with Nix or Cargo:
 
 ```sh
@@ -546,24 +554,22 @@ Config changes don't need a restart: the running agent reloads the file when it 
 
 ### Make a release
 
-Releases are built on a Mac outside the Nix shell, so the binary only loads system libraries. The
-release script builds with the flake's `release-toolchain`, which has the `aarch64-apple-darwin`
-and `x86_64-apple-darwin` targets. You need Nix, Xcode, and a Developer ID Application identity in
-your keychain. Store your notarization credentials once:
+CI publishes, so releasing is a commit and a push. A release is a tag and its notes, with no
+binaries attached. `Cargo.toml` is the single source of truth for the version: `flake.nix` and the
+release job both read it from there. The install commands under
+[Install and check a configuration](#install-and-check-a-configuration) don't, so update their tag
+by hand.
 
-```sh
-xcrun notarytool store-credentials mx-keypad --apple-id <apple-id> --team-id <team-id>
-```
+1. Set the new version in `Cargo.toml`, then run `cargo check` to refresh `Cargo.lock`.
+2. Run `make notes` to scaffold `.github/release-notes/vX.Y.Z.md` from the commits since the last
+   tag, then rewrite the bullets into prose.
+3. Commit all of it as `📦 release: vX.Y.Z` and push.
 
-Then set the version in `Cargo.toml`, commit, and run one of these:
-
-```sh
-scripts/release.sh dist       # universal binary, Developer ID signed, zipped into dist/
-scripts/release.sh notarize   # dist, then notarize the zip with Apple
-scripts/release.sh publish    # notarize, then tag v<version> and create the GitHub release
-```
-
-`mx-keypad install` keeps a release's Developer ID signature instead of re-signing it.
+The `release` job in [ci.yml](.github/workflows/ci.yml) takes it from there. It waits for the
+build, tests, Clippy, and rustfmt to pass on Linux and macOS, then checks whether the commit subject
+is a release for the version in `Cargo.toml`. On any other commit, it stops there. On a release
+commit, it tags, pushes the tag, and creates the GitHub release from the notes file. It fails if
+those notes are missing.
 
 The protocol code is ported from OpenLogi. See [NOTICE](NOTICE) for attribution and licenses and
 [PROTOCOL.md](PROTOCOL.md) for the device protocol. mx-keypad is licensed under MIT or Apache-2.0.

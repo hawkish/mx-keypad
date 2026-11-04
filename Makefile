@@ -1,4 +1,9 @@
-# Local tasks: build, install and manage the LaunchAgent, release.
+# Local tasks: build, install and manage the LaunchAgent.
+#
+# Releasing is not one of them: CI publishes. Bump the version in Cargo.toml,
+# refresh Cargo.lock, run `make notes` and write them, then commit the lot as
+# "📦 release: vX.Y.Z" and push. The release job in .github/workflows/ci.yml
+# tags and publishes once the build is green.
 #
 # Recipes stay one command per line: macOS ships GNU Make 3.81, which has no
 # .ONESHELL, so anything spanning lines has to survive a fresh shell per line.
@@ -12,6 +17,13 @@ BIN := result/bin/mx-keypad
 LOG := $(HOME)/Library/Logs/mx-keypad.log
 CONFIG ?= $(HOME)/.config/mx-keypad/config.json
 
+# Cargo.toml is the single source of truth for the version — flake.nix and the
+# release job both read it the same way.
+VERSION := $(shell awk -F'"' '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version/{print $$2; exit}' Cargo.toml)
+TAG := v$(VERSION)
+NOTES ?= .github/release-notes/$(TAG).md
+TEMPLATE := .github/release-notes/template.md
+
 .PHONY: help
 help:
 	@echo "make build      nix build, into ./result"
@@ -23,7 +35,7 @@ help:
 	@echo "make uninstall  stop the LaunchAgent and remove it"
 	@echo "make status     show whether the LaunchAgent is running"
 	@echo "make log        follow the LaunchAgent's log"
-	@echo "make release    build, sign, notarize and publish (scripts/release.sh publish)"
+	@echo "make notes      scaffold $(NOTES) from the commits since the last tag"
 	@echo
 	@echo "CONFIG defaults to $(CONFIG)"
 
@@ -66,6 +78,17 @@ status:
 log:
 	tail -n 20 -f "$(LOG)"
 
-.PHONY: release
-release:
-	scripts/release.sh publish
+# The commit subjects are a starting point, not the notes — rewrite them into
+# prose that says what changed and why. Everything below them comes from
+# $(TEMPLATE), which is plain markdown you can edit directly.
+#
+# Commit the result with the release commit: the release job refuses to publish
+# without it.
+.PHONY: notes
+notes: $(TEMPLATE)
+	@[ ! -e "$(NOTES)" ] || { echo "notes: $(NOTES) already exists" >&2; exit 1; }
+	@mkdir -p "$(dir $(NOTES))"
+	@{ echo "## Features"; echo; \
+	   git log --reverse --format='- %s' "$$(git describe --tags --abbrev=0)..HEAD"; echo; \
+	   sed 's/{{TAG}}/$(TAG)/g' "$(TEMPLATE)"; } > "$(NOTES)"
+	@echo "wrote $(NOTES) — edit it, then commit it with the release commit"

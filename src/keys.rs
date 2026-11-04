@@ -48,6 +48,7 @@ pub struct Modifiers {
     pub shift: bool,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl Modifiers {
     const SHIFT: Modifiers = Modifiers {
         cmd: false,
@@ -222,16 +223,19 @@ fn ansi_code(c: char) -> Option<u16> {
 
 /// Every character a layout types, with the key code and modifiers that
 /// type it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) type LayoutTable = HashMap<char, (u16, Modifiers)>;
 
 /// The numeric keypad's key codes: searched only after the main block, so a
 /// digit or `+` resolves to the keys a shortcut means.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const KEYPAD: std::ops::RangeInclusive<u16> = 65..=92;
 
 /// Every character a layout types, with the key code and modifiers that
 /// type it. `translate(code, modifiers)` is the layout. The main block wins
 /// over the numeric keypad; within each, the plainest way to type a
 /// character wins: no modifiers, then shift, option, shift+option.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn layout_table(translate: impl Fn(u16, Modifiers) -> Option<char>) -> LayoutTable {
     let mut table = HashMap::new();
     let main = (0..128).filter(|code| !KEYPAD.contains(code));
