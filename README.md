@@ -117,6 +117,22 @@ and remove the agent, run:
 mx-keypad uninstall
 ```
 
+### Troubleshoot: keypad connects but keys do nothing
+
+If the keypad (or Dialpad) connects and shows the right page, but pressing a key has no effect,
+check `~/Library/Logs/mx-keypad.log` for repeated permission errors:
+
+- `macOS has not allowed mx-keypad to send keystrokes` — Accessibility permission is missing. Grant
+  it under **System Settings → Privacy & Security → Accessibility**.
+- `macOS refused to open the MX Dialpad` — Input Monitoring permission is missing. Grant it under
+  **System Settings → Privacy & Security → Input Monitoring**.
+
+Installing a new build (for example after adding a Dialpad binding) changes the binary, and macOS
+can silently revoke both grants even though they stay checked in the list: toggle each one off and
+back on (or remove and re-add mx-keypad with `-`/`+`) for both panes, then restart the agent with
+`mx-keypad uninstall && mx-keypad install --config ...` or `make restart`, and confirm the log
+shows `keypad connected` / `dialpad connected` with no further permission errors.
+
 ## Use the other commands
 
 Use the other commands to check a configuration, draw a tile, or inspect input:
