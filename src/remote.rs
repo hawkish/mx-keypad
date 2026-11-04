@@ -69,6 +69,10 @@ pub enum Request {
     /// in place of the config's `dialpad` section; `null` lets go. The last
     /// connection to send one wins.
     Dialpad(Option<config::DialpadConfig>),
+    /// Set the panel brightness, 1–100, for as long as this connection
+    /// lasts, in place of the config's `brightness`; `null` lets go. The
+    /// last connection to send one wins.
+    Brightness(Option<u8>),
 }
 
 /// A message from the agent to a client.
@@ -355,6 +359,12 @@ pub fn apply(session: &mut Session, id: ConnId, request: Request) -> Result<()> 
             let resolved = dialpad.map(config::resolve_remote_dialpad).transpose()?;
             session.set_remote_dialpad(id, resolved);
         }
+        Request::Brightness(level) => {
+            if let Some(level) = level.filter(|l| !(1..=100).contains(l)) {
+                bail!("brightness: {level} is outside 1–100");
+            }
+            session.set_remote_brightness(id, level);
+        }
     }
     Ok(())
 }
@@ -370,6 +380,7 @@ pub struct Client {
     connecting: Option<mpsc::Receiver<Result<UnixStream>>>,
     desired: Vec<(String, [Key; 9])>,
     dialpad: Option<config::DialpadConfig>,
+    brightness: Option<u8>,
     input: Vec<u8>,
     errors: Vec<String>,
     retry: Instant,
@@ -396,6 +407,7 @@ impl Client {
             connecting: None,
             desired: Vec::new(),
             dialpad: None,
+            brightness: None,
             input: Vec::new(),
             errors: Vec::new(),
             retry: Instant::now(),
@@ -443,6 +455,17 @@ impl Client {
         }
         self.dialpad = dialpad;
         self.send(&Request::Dialpad(self.dialpad.clone()));
+    }
+
+    /// Set the panel brightness, 1–100, while connected, or leave it to the
+    /// agent's config with `None`. Safe to call every frame: only a change
+    /// is sent, and the level is sent again after a reconnect.
+    pub fn set_brightness(&mut self, level: Option<u8>) {
+        if level == self.brightness {
+            return;
+        }
+        self.brightness = level;
+        self.send(&Request::Brightness(level));
     }
 
     /// Turn the keypad to page `name`. Sent only while connected, so call
@@ -504,6 +527,9 @@ impl Client {
                             }
                             if self.dialpad.is_some() {
                                 self.send(&Request::Dialpad(self.dialpad.clone()));
+                            }
+                            if self.brightness.is_some() {
+                                self.send(&Request::Brightness(self.brightness));
                             }
                         }
                         Err(error) => {
@@ -625,6 +651,8 @@ mod tests {
             r#"{"page":{"name":"keys","keys":{"1":{"label":"Esc","action":{"keys":"escape"}}},"show":false}}"#,
             r#"{"dialpad":{"buttons":{"1":{"keys":"escape"}},"dial":{"left":{"page":"prev"},"right":{"page":"next"},"step":5}}}"#,
             r#"{"dialpad":null}"#,
+            r#"{"brightness":70}"#,
+            r#"{"brightness":null}"#,
         ] {
             let request: Request = serde_json::from_str(json).unwrap();
             assert_eq!(serde_json::to_string(&request).unwrap(), json);
@@ -714,6 +742,31 @@ mod tests {
         apply(&mut session, 1, bind).unwrap();
         session.drop_owner(1);
         assert!(session.dialpad().is_none());
+    }
+
+    #[test]
+    fn a_client_sets_the_brightness_until_it_lets_go_or_leaves() {
+        let setup = config::Setup::resolve(
+            serde_json::from_str(r#"{"brightness":40,"pages":[{"name":"main"}]}"#).unwrap(),
+            Path::new("."),
+        )
+        .unwrap();
+        let mut session = Session::new(setup);
+        let request = |json: &str| serde_json::from_str::<Request>(json).unwrap();
+        assert_eq!(session.brightness(), Some(40));
+        for bad in [r#"{"brightness":0}"#, r#"{"brightness":101}"#] {
+            assert!(apply(&mut session, 1, request(bad)).is_err(), "{bad}");
+        }
+        assert_eq!(session.brightness(), Some(40));
+        apply(&mut session, 1, request(r#"{"brightness":70}"#)).unwrap();
+        assert_eq!(session.brightness(), Some(70));
+        // The last client to send one wins; another's `null` leaves it alone.
+        apply(&mut session, 2, request(r#"{"brightness":90}"#)).unwrap();
+        assert_eq!(session.brightness(), Some(90));
+        apply(&mut session, 1, request(r#"{"brightness":null}"#)).unwrap();
+        assert_eq!(session.brightness(), Some(90));
+        session.drop_owner(2);
+        assert_eq!(session.brightness(), Some(40));
     }
 
     struct Sandbox(PathBuf);

@@ -329,12 +329,27 @@ fn follow_page_buttons(session: &Session, keypad: &mut Keypad, state: &mut RunSt
     Ok(())
 }
 
+/// Set the panel to the brightness in force whenever it changes: a client
+/// may have set one or let it go.
+fn follow_brightness(session: &Session, keypad: &mut Keypad, state: &mut RunState) -> Result<()> {
+    let level = session.brightness();
+    if level != state.brightness {
+        if let Some(level) = level {
+            keypad.set_brightness(level)?;
+        }
+        state.brightness = level;
+    }
+    Ok(())
+}
+
 struct RunState {
     path: PathBuf,
     loaded: Option<SystemTime>,
     tiles: HashMap<String, KeyImageJpeg>,
     server: Option<Server>,
     diverted: Option<bool>,
+    /// The brightness last set on the keypad.
+    brightness: Option<u8>,
     /// Watches the Dialpad while the setup binds it.
     dialpad: Option<Watcher>,
     dialpad_connected: bool,
@@ -476,9 +491,9 @@ fn reload(session: &mut Session, keypad: Option<&mut Keypad>, state: &mut RunSta
                 return Ok(());
             };
             follow_page_buttons(session, keypad, state)?;
-            if let Some(level) = session.brightness() {
-                keypad.set_brightness(level)?;
-            }
+            // Set it again even if unchanged, as a reload always has.
+            state.brightness = None;
+            follow_brightness(session, keypad, state)?;
             show(session, keypad, &mut state.tiles)
         }
         Err(error) => {
@@ -517,6 +532,7 @@ fn run(path: &Path) -> Result<()> {
         tiles: HashMap::new(),
         server,
         diverted: None,
+        brightness: None,
         dialpad: None,
         dialpad_connected: false,
     };
@@ -615,11 +631,10 @@ fn connect(
     stop: &AtomicBool,
 ) -> Result<Outcome> {
     state.diverted = None;
+    state.brightness = None;
     state.drain(session);
     follow_page_buttons(session, keypad, state)?;
-    if let Some(level) = session.brightness() {
-        keypad.set_brightness(level)?;
-    }
+    follow_brightness(session, keypad, state)?;
     show(session, keypad, &mut state.tiles)?;
     serve(session, keypad, state, stop)
 }
@@ -635,6 +650,7 @@ fn serve(
     while !stop.load(Ordering::Relaxed) {
         let changed = state.drain(session);
         follow_page_buttons(session, keypad, state)?;
+        follow_brightness(session, keypad, state)?;
         if let Some((pid, owner)) = claim::foreign() {
             return Ok(Outcome::Yielding(pid, owner));
         }

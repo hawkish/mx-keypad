@@ -447,6 +447,7 @@ Protocol v1 uses newline-delimited JSON. Send `hello` first and wait for `welcom
 | Client → agent | `{"show":"agents"}` | Turn to an owned page. |
 | Client → agent | `{"remove":"agents"}` | Remove an owned page. |
 | Client → agent | `{"dialpad":{"buttons":{"1":{"keys":"escape"}}}}` / `{"dialpad":null}` | Bind the MX Dialpad, in the config's `dialpad` format, or let it go. |
+| Client → agent | `{"brightness":70}` / `{"brightness":null}` | Set the panel brightness, 1–100, in place of the config's `brightness`, or let it go. |
 | Agent → client | `{"down":{"page":"agents","key":3}}` / `{"up":{"page":"agents","key":3}}` | Press or release of a grid key, numbered 1–9, that has no action or long press. |
 | Agent → client | `{"error":{"message":"…"}}` | Refused request. After the handshake, the connection stays open. |
 
@@ -475,6 +476,10 @@ A client's `dialpad` bindings replace the config's `dialpad` section until the c
 clients send bindings, the last one wins. As on client pages, `page` actions can only be `next` or
 `prev`. The agent takes over the Dialpad while either the config or a client binds it. See
 [Add an MX Dialpad](#add-an-mx-dialpad).
+
+A client's `brightness` works the same way: it replaces the config's `brightness` until the client
+sends `{"brightness":null}` or disconnects, and the last client to send one wins. Then the config's
+brightness, if it sets one, applies again; otherwise the panel stays as the client left it.
 
 With the `mx-keypad` dependency above, publish a page and handle its presses in Rust:
 

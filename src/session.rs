@@ -71,6 +71,9 @@ pub struct Session {
     /// Dialpad bindings a client sent, which win over the config's while
     /// that client is connected.
     remote_dialpad: Option<(ConnId, DialpadSetup)>,
+    /// Panel brightness a client sent, which wins over the config's while
+    /// that client is connected.
+    remote_brightness: Option<(ConnId, u8)>,
 }
 
 /// How long after a client drops its visible page that page still returns
@@ -96,6 +99,7 @@ impl Session {
             returning: None,
             turned: [0; 2],
             remote_dialpad: None,
+            remote_brightness: None,
         }
     }
 
@@ -251,6 +255,7 @@ impl Session {
         self.remote_held.retain(|_, (id, _)| *id != owner);
         self.remote_events.retain(|e| e.owner != owner);
         self.set_remote_dialpad(owner, None);
+        self.set_remote_brightness(owner, None);
         self.page = self.page_index(&current).unwrap_or(self.visible().start);
     }
 
@@ -337,12 +342,27 @@ impl Session {
         self.turned = [0; 2];
     }
 
-    /// The configured panel brightness, if the config sets one. Apply this
-    /// once per connection — the brightness is global hardware state, not
-    /// per-session.
+    /// The panel brightness in force: a client's, else the config's. `None`
+    /// when neither sets one, and the panel should be left as it is. The
+    /// brightness is global hardware state: apply it when the keypad
+    /// connects and whenever this changes.
     #[must_use]
     pub fn brightness(&self) -> Option<u8> {
-        self.setup.brightness
+        self.remote_brightness
+            .map(|(_, level)| level)
+            .or(self.setup.brightness)
+    }
+
+    /// Set the panel brightness to `level` (1–100) for client `owner`,
+    /// replacing any client's, or drop `owner`'s with `None`.
+    pub fn set_remote_brightness(&mut self, owner: ConnId, level: Option<u8>) {
+        match level {
+            Some(level) => self.remote_brightness = Some((owner, level)),
+            None if self.remote_brightness.is_some_and(|(o, _)| o == owner) => {
+                self.remote_brightness = None;
+            }
+            None => {}
+        }
     }
 
     /// `button` went down: act now, or start timing it when it has a
