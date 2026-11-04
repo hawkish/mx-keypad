@@ -12,9 +12,9 @@ add [remote pages](#remote-pages) while the agent keeps running your configured 
 Releases are source only, so build mx-keypad with Nix or Cargo. Install a release tag:
 
 ```sh
-nix profile install github:hawkish/mx-keypad/v0.10.0
+nix profile install github:hawkish/mx-keypad/v0.10.1
 # Or, with Rust and Cargo installed:
-cargo install --git https://github.com/hawkish/mx-keypad --tag v0.10.0
+cargo install --git https://github.com/hawkish/mx-keypad --tag v0.10.1
 ```
 
 From a checkout, install with Nix or Cargo:
