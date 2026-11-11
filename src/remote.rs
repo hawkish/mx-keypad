@@ -75,6 +75,18 @@ pub enum Request {
     Brightness(Option<u8>),
 }
 
+impl Request {
+    /// The page this request names, so a refusal's [`Reply::Error`] can say
+    /// which one it was about.
+    pub fn page_name(&self) -> Option<&str> {
+        match self {
+            Request::Page { name, .. } | Request::Keys { page: name, .. } => Some(name),
+            Request::Show(name) | Request::Remove(name) => Some(name),
+            Request::Hello { .. } | Request::Dialpad(_) | Request::Brightness(_) => None,
+        }
+    }
+}
+
 /// A message from the agent to a client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -86,7 +98,14 @@ pub enum Reply {
     /// That key came up: sent to the page it went down on.
     Up { page: String, key: u8 },
     /// A refused message. After the handshake the connection stays open.
-    Error { message: String },
+    /// `page` names the page the refused request was about, when there was
+    /// one, so the client can forget its optimistic record of it instead of
+    /// diffing future changes against a page the agent never created.
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page: Option<String>,
+    },
 }
 
 /// What [`Server::drain`] hands the agent's loop.
@@ -262,6 +281,7 @@ fn read_client(
                 &mut stream,
                 &Reply::Error {
                     message: "first message must be hello with protocol 1".into(),
+                    page: None,
                 },
             )?;
             return Ok(());
@@ -306,6 +326,7 @@ fn read_client(
                         &mut stream,
                         &Reply::Error {
                             message: error.to_string(),
+                            page: None,
                         },
                     )
                     .is_err()
@@ -584,7 +605,19 @@ impl Client {
                     Ok(Reply::Up { page, key }) if (1..=9).contains(&key) => {
                         events.push((page, Event::Up(Button::Key(key))))
                     }
-                    Ok(Reply::Error { message }) => self.errors.push(message),
+                    Ok(Reply::Error { message, page }) => {
+                        // `desired` may now claim a page the agent never
+                        // actually created (a `Page` or `Keys` request it
+                        // rejected), which would otherwise keep sending
+                        // `Keys` diffs against state the agent doesn't have,
+                        // forever. Forgetting just that one makes the next
+                        // `set_page` for it resend a full `Page`, the same
+                        // recovery a reconnect already gets.
+                        if let Some(page) = page {
+                            self.desired.retain(|(name, _)| *name != page);
+                        }
+                        self.errors.push(message);
+                    }
                     Ok(_) => self.errors.push("unexpected agent reply".into()),
                     Err(error) => self.errors.push(error.to_string()),
                 }
@@ -627,7 +660,7 @@ fn connect_client(path: &Path, name: &str) -> Result<UnixStream> {
         Reply::Welcome {
             protocol: PROTOCOL, ..
         } => {}
-        Reply::Error { message } => bail!("{message}"),
+        Reply::Error { message, .. } => bail!("{message}"),
         _ => bail!("expected welcome with protocol 1"),
     }
     stream.set_read_timeout(None)?;
@@ -662,6 +695,7 @@ mod tests {
             r#"{"down":{"page":"agents","key":3}}"#,
             r#"{"up":{"page":"agents","key":3}}"#,
             r#"{"error":{"message":"bad icon"}}"#,
+            r#"{"error":{"message":"bad icon","page":"agents"}}"#,
         ] {
             let reply: Reply = serde_json::from_str(json).unwrap();
             assert_eq!(serde_json::to_string(&reply).unwrap(), json);
@@ -866,6 +900,7 @@ mod tests {
             id,
             &Reply::Error {
                 message: "test error".into(),
+                page: None,
             },
         );
         let mut events = Vec::new();
@@ -914,6 +949,59 @@ mod tests {
         assert!(!server.has_clients());
         drop(server);
         assert!(!dir.path().exists());
+    }
+
+    #[test]
+    fn an_error_reply_makes_the_next_set_page_resend_the_full_page() {
+        // A `Page` the agent refuses (bad icon, bad key, ...) never reaches
+        // `desired`'s counterpart on the agent side, but the client still
+        // recorded it as sent. Without forgetting it on an `Error` reply,
+        // every later `set_page` for that name keeps sending `Keys` diffs
+        // against a page the agent never actually created.
+        let dir = Sandbox::new();
+        let mut server = Server::bind(dir.path()).unwrap();
+        let mut client = Client::at("test", dir.path());
+        let faces: [Key; 9] = std::array::from_fn(|_| Key::default());
+        client.set_page("a", faces.clone());
+        until(|| {
+            client.poll();
+            client.connected()
+        });
+        let mut requests = Vec::new();
+        until(|| {
+            requests.extend(server.drain());
+            !requests.is_empty()
+        });
+        let id = match requests[0] {
+            Incoming::Request(id, Request::Page { .. }) => id,
+            ref other => panic!("{other:?}"),
+        };
+        server.send(
+            id,
+            &Reply::Error {
+                message: "refused".into(),
+                page: Some("a".into()),
+            },
+        );
+        until(|| {
+            client.poll();
+            !client.errors.is_empty()
+        });
+        assert_eq!(client.take_errors(), ["refused"]);
+
+        let mut changed = faces.clone();
+        changed[2].label = Some("changed".into());
+        client.set_page("a", changed);
+        let mut resend = Vec::new();
+        until(|| {
+            resend.extend(server.drain());
+            !resend.is_empty()
+        });
+        assert!(
+            matches!(&resend[0], Incoming::Request(_, Request::Page { name, keys, .. }) if name == "a" && keys.len() == 9),
+            "expected a full Page resend, got {:?}",
+            resend[0]
+        );
     }
 
     #[test]

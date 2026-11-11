@@ -457,7 +457,7 @@ Protocol v1 uses newline-delimited JSON. Send `hello` first and wait for `welcom
 | Client → agent | `{"dialpad":{"buttons":{"1":{"keys":"escape"}}}}` / `{"dialpad":null}` | Bind the MX Dialpad, in the config's `dialpad` format, or let it go. |
 | Client → agent | `{"brightness":70}` / `{"brightness":null}` | Set the panel brightness, 1–100, in place of the config's `brightness`, or let it go. |
 | Agent → client | `{"down":{"page":"agents","key":3}}` / `{"up":{"page":"agents","key":3}}` | Press or release of a grid key, numbered 1–9, that has no action or long press. |
-| Agent → client | `{"error":{"message":"…"}}` | Refused request. After the handshake, the connection stays open. |
+| Agent → client | `{"error":{"message":"…"}}` / `{"error":{"message":"…","page":"agents"}}` | Refused request. After the handshake, the connection stays open. `page` names the page the request was about, when there was one, so a [`Client`] can forget its optimistic record of a page the agent never actually created. |
 
 Each key is written exactly as in a config page: `icon`, `label`, `background`, `foreground`,
 `glyph_scale`, `action`, `long_press`, `shifted`, and `blink`, with the default `defaults`. For

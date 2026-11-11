@@ -423,11 +423,13 @@ impl RunState {
         for message in incoming {
             match message {
                 Incoming::Request(id, request) => {
+                    let page = request.page_name().map(str::to_string);
                     if let Err(error) = remote::apply(session, id, request) {
                         server.send(
                             id,
                             &Reply::Error {
                                 message: format!("{error:#}"),
+                                page,
                             },
                         );
                     }
