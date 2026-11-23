@@ -112,14 +112,15 @@ throttle interval. Its label is `dk.mortenhogh.mx-keypad`, its property list is
 By default, install preserves a valid Developer ID signature. Otherwise, it signs the copy with the
 first "Apple Development" identity in your keychain, falling back to the first "Developer ID
 Application" identity, or an ad hoc signature if neither exists. Pass `--identity` with a SHA-1
-hash or name from `security find-identity -v -p codesigning` to choose a different one. Reinstalling
-with the same identity keeps the same signature, so macOS
-remembers the agent's Accessibility permission across rebuilds; an ad hoc signature asks again
-after every install. `uninstall` removes the installed copy along with the agent.
+hash or name from `security find-identity -v -p codesigning` to choose a different one.
 
-For keystroke actions, the LaunchAgent lets macOS ask Accessibility permission for mx-keypad
-instead of a terminal or tmux server. See [Keystroke actions](#keystroke-actions-macos). To stop
-and remove the agent, run:
+Reinstalling with the same identity keeps the same signature, so macOS remembers the agent's
+Input Monitoring, Device Control, and Data Access permissions across rebuilds. An ad hoc signature
+asks again after every install. `uninstall` removes the installed copy along with the agent.
+
+For keystroke actions, the LaunchAgent lets macOS ask Input Monitoring, Device Control, and Data
+Access permission for mx-keypad instead of a terminal or tmux server. See
+[Keystroke actions](#keystroke-actions-macos). To stop and remove the agent, run:
 
 ```sh
 mx-keypad uninstall
@@ -130,16 +131,17 @@ mx-keypad uninstall
 If the keypad (or Dialpad) connects and shows the right page, but pressing a key has no effect,
 check `~/Library/Logs/mx-keypad.log` for repeated permission errors:
 
-- `macOS has not allowed mx-keypad to send keystrokes` — Accessibility permission is missing. Grant
-  it under **System Settings → Privacy & Security → Accessibility**.
+- `macOS has not allowed mx-keypad to send keystrokes` — Input Monitoring, Device Control, or Data
+  Access permission is missing. Grant it under **System Settings → Privacy & Security → Input
+  Monitoring**, **Device Control**, and **Data Access**.
 - `macOS refused to open the MX Dialpad` — Input Monitoring permission is missing. Grant it under
   **System Settings → Privacy & Security → Input Monitoring**.
 
-Installing a new build (for example after adding a Dialpad binding) changes the binary, and macOS
-can silently revoke both grants even though they stay checked in the list: toggle each one off and
-back on (or remove and re-add mx-keypad with `-`/`+`) for both panes, then restart the agent with
-`mx-keypad uninstall && mx-keypad install --config ...` or `make restart`, and confirm the log
-shows `keypad connected` / `dialpad connected` with no further permission errors.
+Installing a new build (for example after adding a Dialpad binding) changes the binary. macOS can
+silently revoke both grants even though they stay checked in the list. Toggle each one off and back
+on (or remove and re-add mx-keypad with `-`/`+`) for both panes, then restart the agent with
+`mx-keypad uninstall && mx-keypad install --config ...` or `make restart`. Confirm the log shows
+`keypad connected` / `dialpad connected` with no further permission errors.
 
 ## Use the other commands
 
@@ -215,7 +217,7 @@ This example uses one page and nine keys. Save it as a JSON file and pass its pa
 | `pages[].keys.<key>.glyph_scale` | Optional icon size, from `0.05` to `1.0`; overrides `defaults.glyph_scale`. |
 | `pages[].keys.<key>.action` | Optional action from the table below. Defaults to `"none"`. |
 | `pages[].keys.<key>.long_press` | Optional action to perform instead of `action` when the key is held for at least `defaults.long_press_ms`. |
-| `pages[].keys.<key>.shifted` | Optional. What the key shows and does while shift is on. Takes `icon`, `label`, `background`, `foreground`, `glyph_scale`, `action` and `long_press`; each one you leave out follows the key's own, shifted automatically (see below). |
+| `pages[].keys.<key>.shifted` | Optional. What the key shows and does while shift is on. Takes `icon`, `label`, `background`, `foreground`, `glyph_scale`, `action`, and `long_press`; each one you leave out follows the key's own, shifted automatically (see below). |
 | `pages[].keys.<key>.blink` | Optional. Makes the key blink between its face and one with `background` (default `#000000`) and `foreground` (default: the key's own). Each face shows for `interval_ms`, from `200` to `10000`; default `500`, which is 1 Hz. |
 | `page_buttons.left` | Optional action for the left page button. Default: `{ "page": "prev" }`. |
 | `page_buttons.right` | Optional action for the right page button. Default: `{ "page": "next" }`. |
@@ -236,7 +238,7 @@ page doesn't restart them. For example, a blue key that flashes black once a sec
 ### Shift
 
 A key with a `shift` action is the keypad's own shift. While shift is on, every other key uses its
-shifted binding, and the keys redraw to show it. The shift key itself shows its colours swapped, so
+shifted binding, and the keys redraw to show it. The shift key itself shows its colors swapped, so
 you can see when shift is latched. Keys you don't give a `shifted` field are shifted automatically:
 
 | Action | While shift is on |
@@ -312,13 +314,15 @@ The main keyboard block takes precedence over the numeric keypad. If the layout 
 character, a US ANSI position is used where one exists; otherwise, the fallback is key code 0.
 On a US layout, `plus` resolves to shift+`=`. Use `resolve` to check the result.
 
-macOS requires Accessibility permission for the process responsible for mx-keypad. If the startup
-configuration has an input-posting action, `run` requests the system prompt and prints a reminder
-when it isn't trusted. The actions fail until permission is granted under **System Settings →
-Privacy & Security → Accessibility**. When started from a terminal, grant permission to the
-terminal app; inside tmux, grant it to the tmux server. Because tmux runs as a separate server,
-granting permission to the terminal alone doesn't help. Use the LaunchAgent to have macOS request
-permission for mx-keypad itself. Rebuilding the binary may cause macOS to ask again.
+macOS requires Input Monitoring, Device Control, and Data Access permission for the process that
+runs mx-keypad, granted under **System Settings → Privacy & Security**. If the startup
+configuration has an input-posting action, `run` requests the prompt and reminds you when it isn't
+trusted yet.
+
+Grant the permission to the right process: a terminal when you start `run` from one, or the tmux
+server when `run` lives inside tmux — granting it to the terminal alone doesn't help there, because
+tmux runs as a separate server. The LaunchAgent sidesteps this, since it lets macOS prompt
+mx-keypad itself. Rebuilding the binary may trigger the prompt again.
 
 ## Add an MX Dialpad
 
@@ -365,9 +369,9 @@ On macOS, opening the Dialpad needs **Input Monitoring** permission, because it'
 Turn it on for mx-keypad under **System Settings** > **Privacy & Security** > **Input
 Monitoring**. When you run mx-keypad from a terminal, the terminal needs the permission instead.
 If the permission is missing, `run` logs "macOS refused to open the MX Dialpad". If the switch is
-already on, a terminal that was updated since you granted it may no longer match the permission:
-remove the terminal from the list, add it again, and restart it. Dialpad support has only been
-tested on macOS.
+already on, a terminal updated since you granted it may no longer match the permission. Remove the
+terminal from the list, add it again, and restart it. Dialpad support has only been tested on
+macOS.
 
 ## Use the library
 
@@ -404,18 +408,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 `Keypad::open` returns `Ok(None)` when no matching device is found. `Keypad` also provides
 `set_brightness`, `divert_page_buttons`, and `poll`; dropping it attempts to restore diverted page
 buttons. The `mx_keypad::keys` module posts shortcuts and typed text on macOS, and reports whether
-the process is trusted for Accessibility.
+the process is trusted for Input Monitoring, Device Control, and Data Access.
 
 ### Running a config
 
-`mx_keypad::session::Session` is the engine behind `mx-keypad run`: given a `config::Setup`, it
+`mx_keypad::session::Session` is the engine behind `mx-keypad run`. Given a `config::Setup`, it
 decides what each key shows (`Session::face`, blink- and shift-aware) and performs an action's side
 effects when told a button went down or up (`Session::down`, `Session::up`), including held `hold`
-and `switch` shortcuts, `sequence` steps on a background thread, and the keypad's own shift. A
-`Session` never touches a `Keypad` or a terminal — reading presses, drawing tiles, diverting the
-page buttons, and reloading the config from disk stay the caller's job, which is what keeps it
-usable by a program that only wants to borrow the keypad for one of its own pages alongside
-something else, such as tmux-legion's agent-status page:
+and `switch` shortcuts, `sequence` steps on a background thread, and the keypad's own shift.
+
+A `Session` never touches a `Keypad` or a terminal. Reading presses, drawing tiles, diverting the
+page buttons, and reloading the config from disk stay the caller's job. That's what makes it usable
+by a program that only wants to borrow the keypad for one of its own pages alongside something
+else, such as tmux-legion's agent-status page:
 
 ```rust
 use mx_keypad::config::Setup;
@@ -439,8 +444,9 @@ fn demo() -> anyhow::Result<()> {
 ## Remote pages
 
 Publish a page from another program while `mx-keypad run` owns the device. The page's keys use
-the config's own key format, and the agent runs their actions itself, so the other program never
-needs Accessibility. Keys without an action are sent back to that program as presses instead. Connect to `$XDG_STATE_HOME/mx-keypad/agent.sock`, or
+the config's own key format, and the agent runs their actions itself. The other program never
+needs Input Monitoring, Device Control, or Data Access permission — keys without an action are sent
+back to it as presses instead. Connect to `$XDG_STATE_HOME/mx-keypad/agent.sock`, or
 `~/.local/state/mx-keypad/agent.sock` when `XDG_STATE_HOME` isn't an absolute path. The socket has
 mode `0600` and stays available while the keypad is unplugged or a legacy claim is active.
 
@@ -468,11 +474,13 @@ The agent checks a whole request before applying any of it.
 While any client has a page, the clients' pages replace the config's: the keypad turns to the
 first one, and page-turn actions go through the client pages only, in the order they were added.
 The config's pages come back when the last client page goes. The agent takes over the page buttons
-whenever a remote page exists. Names share one namespace:
-a client can replace its own page but can't take another client's or a config page's name.
-Disconnecting removes that client's pages. Removing the visible page shows the first client page left,
-or the first config page when none is; removing another page keeps the current one. Config reloads preserve remote pages and the
-current page by name. A reload that collides with a remote name keeps the previous config.
+whenever a remote page exists.
+
+Names share one namespace: a client can replace its own page but can't take another client's or a
+config page's name. Disconnecting removes that client's pages. Removing the visible page shows the
+first client page left, or the first config page when none is; removing another page keeps the
+current one. Config reloads preserve remote pages and the current page by name. A reload that
+collides with a remote name keeps the previous config.
 
 A release goes to the page that received its press, even after a page turn. Shift, long press and
 blink work on remote pages as on config pages, and the keypad's shift is shared by every page.
@@ -541,7 +549,7 @@ The Makefile wraps the everyday tasks. Run `make help` for the full list:
 | Command | What it does |
 |---|---|
 | `make install` | Builds with Nix, checks your config, then installs and starts the LaunchAgent. Use it after every change to the code. |
-| `make restart` | Restarts the running LaunchAgent, for example after granting Accessibility. |
+| `make restart` | Restarts the running LaunchAgent, for example after granting Input Monitoring, Device Control, or Data Access. |
 | `make stop` | Stops the LaunchAgent until the next login or `make install`. |
 | `make uninstall` | Stops the LaunchAgent and removes it. |
 | `make status` | Shows whether the LaunchAgent is running. |
