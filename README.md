@@ -131,11 +131,9 @@ mx-keypad uninstall
 If the keypad (or Dialpad) connects and shows the right page, but pressing a key has no effect,
 check `~/Library/Logs/mx-keypad.log` for repeated permission errors:
 
-- `macOS has not allowed mx-keypad to send keystrokes` — Input Monitoring, Device Control, or Data
-  Access permission is missing. Grant it under **System Settings → Privacy & Security → Input
-  Monitoring**, **Device Control**, and **Data Access**.
-- `macOS refused to open the MX Dialpad` — Input Monitoring permission is missing. Grant it under
-  **System Settings → Privacy & Security → Input Monitoring**.
+- `macOS has not allowed mx-keypad to send keystrokes` — Input Monitoring or Device Control or Data
+  Access permission is missing. Grant them under **System Settings → Privacy & Security → Input
+  Monitoring** and **Device Control and Data Access**.
 
 Installing a new build (for example after adding a Dialpad binding) changes the binary. macOS can
 silently revoke both grants even though they stay checked in the list. Toggle each one off and back
